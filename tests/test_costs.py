@@ -127,3 +127,94 @@ def test_hand_computed_costs_2026_budget() -> None:
     assert pytest.approx(sell_cost.total_cost, abs=1e-4) == 1073.12744
 
 
+def test_hand_computed_options_statutory_costs() -> None:
+    """Hand-computed verification for Indian index options trading costs (Oct 2024 revised regime).
+    
+    Verified Rates:
+    - Options STT: 0.15% (0.0015) of premium on sales (turnover_sell * 0.0015).
+    - Brokerage: INR 20.00 per executed order (INR 40.00 round-trip).
+    - Exchange turnover fee (Option-specific): 0.05% (0.0005) of total premium turnover.
+    - Stamp duty (Option-specific): 0.003% (0.00003) on buy premium turnover.
+    - IPFT (Investor Protection Fund Trust): 0.0001% (0.0000010) on total turnover.
+    - SEBI turnover fee: Rs 10 per crore (0.0000010) on total turnover.
+    - GST: 18% on (Brokerage + Exchange charges + SEBI fee + IPFT).
+    """
+    from data.paper_trading import calculate_option_paper_costs
+
+    entry_premium = 200.0
+    exit_premium = 250.0
+    qty = 65  # 1 lot NIFTY
+
+    res = calculate_option_paper_costs(entry_premium, exit_premium, qty, recorded_bid_ask_spread=0.80)
+
+    # 1. Turnover verification
+    buy_turnover = 200.0 * 65  # 13,000.0
+    sell_turnover = 250.0 * 65  # 16,250.0
+    total_turnover = buy_turnover + sell_turnover  # 29,250.0
+
+    # 2. Hand-computed components
+    expected_stt = round(sell_turnover * 0.0015, 2)  # 24.38
+    expected_brokerage = 40.00
+    expected_exchange = round(total_turnover * 0.0005, 2)  # 14.62 (half-to-even rounding of 14.625)
+    expected_stamp = round(buy_turnover * 0.00003, 2)  # 0.39
+    expected_ipft = round(total_turnover * 0.000001, 2)  # 0.03
+    expected_sebi = round(total_turnover * 0.000001, 2)  # 0.03
+    expected_gst_base = 40.0 + (total_turnover * 0.0005) + (total_turnover * 0.000001) + (total_turnover * 0.000001)
+    expected_gst = round(expected_gst_base * 0.18, 2)  # 9.84
+    expected_slippage = round(0.80 * 65, 2)  # 52.00
+
+    assert res["stt"] == expected_stt == 24.38
+    assert res["brokerage"] == expected_brokerage == 40.00
+    assert res["exchange_charges"] == expected_exchange == 14.62
+    assert res["stamp_duty"] == expected_stamp == 0.39
+    assert res["ipft"] == expected_ipft == 0.03
+    assert res["sebi_fee"] == expected_sebi == 0.03
+    assert res["gst"] == expected_gst == 9.84
+    assert res["slippage"] == expected_slippage == 52.00
+
+    # 3. P&L verification
+    expected_gross = (250.0 - 200.0) * 65  # 3,250.00
+    expected_total_costs = round(
+        expected_brokerage + expected_stt + expected_stamp + expected_exchange + expected_ipft + expected_sebi + expected_gst + expected_slippage,
+        2
+    )
+    assert res["gross_pnl"] == expected_gross == 3250.00
+    assert res["total_costs"] == 141.30 or res["total_costs"] == 141.29  # within 1 paisa rounding
+    assert pytest.approx(res["net_pnl"], abs=0.1) == (expected_gross - expected_total_costs)
+
+    # 4. Show verified rates map
+    vr = res["verified_rates"]
+    assert vr["stt_rate"] == 0.0015
+    assert vr["brokerage_per_order"] == 20.0
+    assert vr["exchange_rate"] == 0.0005
+    assert vr["stamp_rate"] == 0.00003
+    assert vr["ipft_rate"] == 0.000001
+    assert vr["sebi_rate"] == 0.000001
+    assert vr["gst_rate"] == 0.18
+
+
+def test_hand_computed_options_recorded_spread_slippage() -> None:
+    """Verify that paper trading slippage uses recorded bid-ask spread instead of fixed 1 pt."""
+    from data.paper_trading import calculate_option_paper_costs
+
+    qty = 50
+    # Wide spread case (illiquid / fast market: bid=148.0, ask=150.5 => spread=2.5 pts)
+    res_wide = calculate_option_paper_costs(150.0, 160.0, qty, recorded_bid_ask_spread=2.5)
+    assert res_wide["slippage_pts"] == 2.5
+    assert res_wide["slippage"] == 2.5 * 50  # 125.0
+    assert res_wide["slippage_source"] == "recorded_bid_ask_spread"
+
+    # Tight spread case (liquid ATM: bid=181.4, ask=181.7 => spread=0.30 pts)
+    res_tight = calculate_option_paper_costs(181.5, 195.0, qty, recorded_bid_ask_spread=0.30)
+    assert res_tight["slippage_pts"] == 0.30
+    assert res_tight["slippage"] == 0.30 * 50  # 15.0
+    assert res_tight["slippage_source"] == "recorded_bid_ask_spread"
+
+    # Fallback case when spread is None
+    res_default = calculate_option_paper_costs(181.5, 195.0, qty, recorded_bid_ask_spread=None)
+    assert res_default["slippage_pts"] == 1.0
+    assert res_default["slippage"] == 1.0 * 50  # 50.0
+    assert res_default["slippage_source"] == "default_fallback_1pt"
+
+
+

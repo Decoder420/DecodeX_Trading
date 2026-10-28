@@ -284,4 +284,80 @@ def test_tradingview_2pane_and_toolbar_toggles():
     assert "Hard Cap SL" in html
 
 
+def test_generate_chart_uirevision_key():
+    """Verify that uirevision key includes instrument, timeframe, and expiry."""
+    from dashboard.charting import generate_chart_uirevision
+
+    key1 = generate_chart_uirevision("NIFTY", "15m", "03NOV2026")
+    assert key1 == "NIFTY_15m_03NOV2026_chart_state"
+
+    key2 = generate_chart_uirevision("banknifty", "1d", "23nov2026")
+    assert key2 == "BANKNIFTY_1d_23NOV2026_chart_state"
+
+    key3 = generate_chart_uirevision("SENSEX", "5m", None)
+    assert key3 == "SENSEX_5m_CURRENT_chart_state"
+
+
+def test_chart_refresh_does_not_reapply_tight_y_bounds():
+    """Verify that initial render applies tight Y-axis bounds, but refresh leaves bounds open for zoom/pan."""
+    from dashboard.charting import build_15m_candlestick_figure
+    from dashboard.intraday_data import get_live_15m_candles
+
+    engine = IntradaySignalEngine("NIFTY")
+    intraday_atr = 59.16
+    plan = engine.compute_signal(
+        spot_price=22753.2,
+        ema_21=22780.0,
+        ema_50=22810.0,
+        adx_14=28.5,
+        atr_14=intraday_atr,
+        account_equity=1000000.0,
+    )
+    candles = get_live_15m_candles("NIFTY", "2026-10-26", live_ltp=22753.2)
+    sig_df = engine.generate_intraday_log(plan, "2026-10-26")
+
+    # Initial Render: is_refresh = False -> Tight bounds must be applied
+    fig_initial = build_15m_candlestick_figure(
+        df_candles=candles,
+        trade_plan=plan,
+        signal_log_df=sig_df,
+        instrument="NIFTY",
+        timeframe="15m",
+        expiry="03NOV2026",
+        is_refresh=False,
+    )
+    assert fig_initial.layout.uirevision == "NIFTY_15m_03NOV2026_chart_state"
+    assert fig_initial.layout.yaxis.range is not None
+    assert len(fig_initial.layout.yaxis.range) == 2
+
+    # Fragment Refresh: is_refresh = True -> Do NOT reapply tight bounds (preserve user zoom/pan)
+    fig_refresh = build_15m_candlestick_figure(
+        df_candles=candles,
+        trade_plan=plan,
+        signal_log_df=sig_df,
+        instrument="NIFTY",
+        timeframe="15m",
+        expiry="03NOV2026",
+        is_refresh=True,
+    )
+    assert fig_refresh.layout.uirevision == "NIFTY_15m_03NOV2026_chart_state"
+    assert fig_refresh.layout.yaxis.range is None
+    assert fig_refresh.layout.yaxis.autorange is True
+
+
+def test_calculate_tight_y_axis_bounds_helper():
+    """Verify standalone tight Y-axis bounding calculation helper."""
+    from dashboard.charting import calculate_tight_y_axis_bounds
+    from dashboard.intraday_data import get_live_15m_candles
+
+    candles = get_live_15m_candles("NIFTY", "2026-10-26", live_ltp=22753.2)
+    c_low = float(candles["low"].min())
+    c_high = float(candles["high"].max())
+
+    y_min, y_max = calculate_tight_y_axis_bounds(candles, trade_plan=None, padding_pts=30.0)
+    assert abs(y_min - (c_low - 30.0)) < 0.1
+    assert abs(y_max - (c_high + 30.0)) < 0.1
+
+
+
 

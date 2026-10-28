@@ -148,3 +148,46 @@ def test_labels_module_triple_barrier() -> None:
     assert "target_fwd_ret_1" in fwd.columns
     assert "target_dir_1" in fwd.columns
     assert fwd.iloc[0]["target_dir_1"] == 1
+
+
+def test_expiry_labeling_17nov2026_weekly():
+    """Verify that 17NOV2026 is strictly classified as Weekly Expiry (19d), NOT Monthly Expiry.
+    
+    In November 2026 for NIFTY (Tuesday expiry regime):
+    - 2026-11-03: Candidate 0 (Near Weekly)
+    - 2026-11-10: Candidate 1 (Weekly)
+    - 2026-11-17: Candidate 2 (Weekly Expiry, 19d to expiry)
+    - 2026-11-24: Candidate 3 (Monthly Expiry, last Tuesday of month)
+    """
+    cfg = ConfigManager()
+
+    dt_17nov = date(2026, 11, 17)
+    rule = cfg.get_expiry_rule("NIFTY", dt_17nov)
+    assert rule["frequency"] == "weekly"
+    assert rule["day_of_week"] == "Tuesday"
+
+    # Candidates in November 2026
+    target_weekday = cfg._day_name_to_weekday("Tuesday")
+    candidates = cfg._get_candidate_expiry_dates_in_month(2026, 11, target_weekday, "weekly")
+    resolved_cands = [cfg.resolve_expiry_date(c) for c in candidates]
+
+    # Verify 17NOV2026 is candidate 2
+    assert dt_17nov in resolved_cands
+    assert resolved_cands.index(dt_17nov) == 2
+
+    # Monthly contract is strictly the last candidate
+    monthly_cand = resolved_cands[-1]
+    assert monthly_cand == date(2026, 11, 24) or monthly_cand == date(2026, 11, 23)
+    assert dt_17nov != monthly_cand, "17NOV2026 must NOT be marked as monthly!"
+
+    # Verify options_chain labeling logic
+    from dashboard.options_chain import get_available_expiries
+    expiries = get_available_expiries("NIFTY")
+    # If scrip cache contains 17NOV2026 or fallback, verify tag
+    for exp_str, label in expiries:
+        if "17NOV2026" in exp_str:
+            assert "Weekly" in label
+            assert "Monthly" not in label
+        if "23NOV2026" in exp_str or "24NOV2026" in exp_str:
+            assert "Monthly" in label
+

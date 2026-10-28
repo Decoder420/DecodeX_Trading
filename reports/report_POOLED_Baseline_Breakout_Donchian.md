@@ -1,0 +1,93 @@
+# Quantitative Walk-Forward Research Report: Baseline_Breakout_Donchian on POOLED
+
+> [!IMPORTANT]
+> **Proxy & Historical Continuity Disclaimer**:
+> 1. **Index Futures Proxy**: Cash index series are utilized as the tradable proxy for index futures. Basis fluctuations and roll gaps are omitted in this representation.
+> 2. **SENSEX Historical Derivative Extension**: SENSEX derivatives contracts prior to the May 2023 relaunch are hypothetical / back-extended.
+> 3. **Non-Execution Notice**: This system is built strictly for decision support and quantitative statistical research. Zero live execution. Never implies guaranteed profitability.
+
+## 1. Executive Summary & Decision Gate: **Class C (No Edge After Costs)**
+- **Verdict Rationale**: Model produces negative or flat net return after transaction costs and slippage. No statistical edge detected.
+- **Model**: `Baseline_Breakout_Donchian` | **Instrument**: `POOLED`
+- **Validation Period**: `2015-01-01` to `2024-10-31` (10 Expanding Walk-Forward Folds, Burn-In 252 Bars Dropped)
+- **Slippage Setting**: Base `base` (1.5 bps/side) vs Stress (5.0 bps/side)
+- **Sample Size Qualification**: ⚠️ STATISTICALLY WEAK (< 100 trades)
+
+---
+
+## 2. Performance Metrics vs Benchmarks
+
+| Metric | Walk-Forward Strategy (Base Slippage) | Walk-Forward (Stress 5 bps) | Buy & Hold Benchmark | Random Baseline (1,000 Seeds Mean) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Sharpe Ratio** | **-0.52** | -0.52 | 5.74 | -0.01 |
+| **CAGR** | **nan%** | nan% | 17.00% | N/A |
+| **Sortino Ratio** | **-0.04** | -0.04 | N/A | N/A |
+| **Max Drawdown** | **107.44%** | 107.44% | 81.86% | N/A |
+| **Calmar Ratio** | **nan** | nan | N/A | N/A |
+| **Win Rate** | **48.28%** | 48.28% | N/A | ~50.0% |
+| **Profit Factor** | **0.03** | 0.03 | N/A | ~1.00 |
+| **Total Net P&L** | **Rs -1,074,717.81** | Rs -1,074,684.54 | N/A | N/A |
+| **Total Trade Count** | **29** | 29 | 1 | 29 |
+| **Market Exposure** | **1.4%** | 1.4% | 100.0% | N/A |
+| **Expectancy / Trade**| **Rs -37,059.23** | N/A | N/A | N/A |
+
+### Multiple Testing & Statistical Significance
+- **Random Baseline Percentile Rank**: **40.6%** (Higher than 40.6% of 1,000 random noise strategies)
+- **Tested Hyperparameter Variants Count**: `48` combinations evaluated
+- **Deflated Sharpe Ratio (DSR)**: **0.0000** (Not statistically significant after accounting for multiple trials)
+
+---
+
+## 3. Trade Gating Filter Removal Breakdown
+
+| Gate / Filter | Trades Dropped | Description & Threshold |
+| :--- | :---: | :--- |
+| **Raw Signals Emitted** | **649** | Total BUY (401) and SELL (248) raw signals |
+| **Data Gap Gate** | **0** | Signals falling on or within 3 bars of `DATA_MISSING_IN_FEED` |
+| **Confidence Gate** | **0** | Signals below calibrated probability threshold |
+| **Regime Filter Gate** | **5** | Signals occurring in `UNKNOWN` or `HIGH_VOL` regime |
+| **VIX Percentile Gate** | **153** | Signals where VIX percentile > 85% or < 5% |
+| **Expiry Proximity Gate**| **96** | Signals within 1 day of derivatives contract expiry |
+| **Final Executed Signals** | **395** | Final approved trades (266 BUY, 129 SELL) |
+| **Total Filter Removal Rate** | **0.0%** | Overall fraction of raw signals filtered out |
+
+---
+
+## 4. Multi-Dimensional Performance Breakdowns
+
+### A. Annual Breakdown (Walk-Forward Test Folds 2015–2024)
+| Year | Trades | Win Rate | Net P&L (INR) |
+| :---: | :---: | :---: | :---: |
+| 2015 | 29 | 48.3% | Rs -1,074,717.81 |
+
+### B. Regime Breakdown
+| Market Regime | Trades | Win Rate | Net P&L (INR) |
+| :--- | :---: | :---: | :---: |
+| TRENDING | 17 | 47.1% | Rs -1,065,991.19 |
+| RANGING | 12 | 50.0% | Rs -8,726.62 |
+| HIGH_VOL | 0 | 0.0% | Rs 0.00 |
+
+### C. Direction Breakdown (Long vs Short)
+| Direction | Trades | Win Rate | Net P&L (INR) |
+| :--- | :---: | :---: | :---: |
+| **BUY (Long)** | 18 | 50.0% | Rs -480,992.69 |
+| **SELL (Short)** | 11 | 45.5% | Rs -593,725.12 |
+
+---
+
+## 5. Walk-Forward Fold Progression
+| Fold | Test Year | Test Window | Trades | Win Rate | Net P&L | Final Equity | Sharpe |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 1 | 2015 | 2015-01-01 to 2015-12-31 | 29 | 48.3% | Rs -1,074,717.81 | Rs -74,717.81 | -1.66 |
+| 2 | 2016 | 2016-01-01 to 2016-12-30 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 3 | 2017 | 2017-01-02 to 2017-12-29 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 4 | 2018 | 2018-01-01 to 2018-12-31 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 5 | 2019 | 2019-01-01 to 2019-12-31 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 6 | 2020 | 2020-01-01 to 2020-12-31 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 7 | 2021 | 2021-01-01 to 2021-12-31 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 8 | 2022 | 2022-01-03 to 2022-12-30 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 9 | 2023 | 2023-01-02 to 2023-12-29 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+| 10 | 2024 | 2024-01-01 to 2024-10-31 | 0 | 0.0% | Rs 0.00 | Rs -74,717.81 | 0.00 |
+
+---
+*(Report generated by Antigravity Quantitative Research Platform - Part 2)*

@@ -1,0 +1,456 @@
+project:
+  name: "Quantitative Signal Platform - Part 1"
+  version: "1.0.0"
+  random_seed: 42
+  environment: "development"
+
+market:
+  timezone: "Asia/Kolkata"
+  session:
+    market_open: "09:15"
+    market_close: "15:30"
+  holiday_calendar_path: "config/holidays.yaml"
+
+data:
+  active_timeframe: "1d"         # Options: "1d" (primary), "15m" (secondary)
+  supported_timeframes: ["1d", "15m"]
+  provider:
+    primary: "angelone"          # Options: "angelone", "yfinance", "upstox"
+    fallback: "yfinance"
+    rate_limits:
+      max_requests_per_second: 3
+      retry_attempts: 4
+      retry_backoff_factor: 2.0
+      intraday_chunk_days: 30    # Maximum days per historical request chunk for intraday
+    angelone:
+      scrip_master_url: "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+      cache_path: "data/cache/angel_scrip_master.json"
+      cache_ttl_hours: 24
+  storage:
+    backend: "duckdb"            # Options: "duckdb", "sqlite"
+    duckdb_path: "data/market_data.duckdb"
+    sqlite_path: "data/market_data.db"
+
+# NOTE: Lot sizes and expiry schedules are time-varying in Indian derivatives markets.
+# User note: Verify against exchange contract master notifications before live deployment.
+instruments:
+  NIFTY:
+    name: "NIFTY 50"
+    exchange: "NSE"
+    tradable_proxy: "NIFTY_FUT"
+    tick_size: 0.05
+    lot_size_history:
+      # Complete progression from 2010 to present
+      - effective_from: "2010-01-01"
+        lot_size: 50
+        status: "Verified"
+      - effective_from: "2015-10-30"
+        lot_size: 75
+        status: "Verified"
+      - effective_from: "2021-04-30"
+        lot_size: 50
+        status: "Verified"
+      - effective_from: "2024-04-26"
+        lot_size: 25
+        status: "Verified"
+      - effective_from: "2024-11-20"
+        lot_size: 75
+        status: "Verified"
+      - effective_from: "2025-12-30"
+        lot_size: 65             # Replaced 75 around Dec 2025 / Jan 2026
+        status: "Unverified"
+    expiry_rules_history:
+      # Complete progression from 2010 to present with no coverage gaps
+      - effective_from: "2010-01-01"
+        frequency: "monthly"
+        day_of_week: "Thursday"  # Monthly only, last Thursday (prior to weekly options)
+        status: "Verified"
+      - effective_from: "2019-02-11"
+        frequency: "weekly"
+        day_of_week: "Thursday"  # Weekly options launched
+        status: "Verified"
+      - effective_from: "2025-09-01"
+        frequency: "weekly"
+        day_of_week: "Tuesday"   # Schedule from Sep 2025
+        status: "Unverified"
+    symbols:
+      yfinance: "^NSEI"
+      angelone:
+        symbol: "NIFTY"
+        exchange: "NSE"
+        instrument_type: "AMXIDX"
+      upstox: "NSE_INDEX|Nifty 50"
+
+  BANKNIFTY:
+    name: "BANK NIFTY"
+    exchange: "NSE"
+    tradable_proxy: "BANKNIFTY_FUT"
+    tick_size: 0.05
+    lot_size_history:
+      - effective_from: "2010-01-01"
+        lot_size: 25
+        status: "Verified"
+      - effective_from: "2016-05-27"
+        lot_size: 40
+        status: "Verified"
+      - effective_from: "2020-07-01"
+        lot_size: 25
+        status: "Verified"
+      - effective_from: "2023-07-01"
+        lot_size: 15
+        status: "Verified"
+      - effective_from: "2024-11-20"
+        lot_size: 35             # Revised under SEBI index derivatives framework
+        status: "Verified"
+      - effective_from: "2025-12-30"
+        lot_size: 30             # Replaced 35 around Dec 2025 / Jan 2026
+        status: "Unverified"
+    expiry_rules_history:
+      - effective_from: "2010-01-01"
+        frequency: "monthly"
+        day_of_week: "Thursday"  # Monthly only, last Thursday (prior to weekly options)
+        status: "Verified"
+      - effective_from: "2016-05-27"
+        frequency: "weekly"
+        day_of_week: "Thursday"  # Weekly options launched
+        status: "Verified"
+      - effective_from: "2023-09-04"
+        frequency: "weekly"
+        day_of_week: "Wednesday" # Shifted to Wednesday weekly
+        status: "Verified"
+      - effective_from: "2024-11-20"
+        frequency: "monthly"     # SEBI 1-weekly-per-exchange framework: monthly only, last Thursday
+        day_of_week: "Thursday"
+        status: "Verified"
+      - effective_from: "2025-09-01"
+        frequency: "monthly"
+        day_of_week: "Tuesday"   # Monthly only, last Tuesday
+        status: "Unverified"
+    symbols:
+      yfinance: "^NSEBANK"
+      angelone:
+        symbol: "BANKNIFTY"
+        exchange: "NSE"
+        instrument_type: "AMXIDX"
+      upstox: "NSE_INDEX|Nifty Bank"
+
+  SENSEX:
+    name: "BSE SENSEX"
+    exchange: "BSE"
+    tradable_proxy: "SENSEX_FUT"
+    tick_size: 0.05
+    lot_size_history:
+      - effective_from: "2010-01-01"
+        lot_size: 50
+        status: "Verified"
+      - effective_from: "2023-05-12"
+        lot_size: 10             # BSE derivatives relaunch
+        status: "Verified"
+      - effective_from: "2024-11-20"
+        lot_size: 20             # Revised under SEBI index derivatives framework
+        status: "Verified"
+      - effective_from: "2025-09-01"
+        lot_size: 20             # Current lot size
+        status: "Unverified"
+    expiry_rules_history:
+      - effective_from: "2010-01-01"
+        frequency: "monthly"
+        day_of_week: "Thursday"  # Monthly only, last Thursday
+        status: "Verified"
+      - effective_from: "2023-05-12"
+        frequency: "weekly"
+        day_of_week: "Friday"    # BSE Friday weekly relaunch
+        status: "Verified"
+      - effective_from: "2024-11-20"
+        frequency: "weekly"
+        day_of_week: "Tuesday"   # SEBI framework: BSE shifted weekly to Tuesday (Nov 2024 to Aug 2025)
+        status: "Verified"
+      - effective_from: "2025-09-01"
+        frequency: "weekly"
+        day_of_week: "Thursday"  # Shifted to Thursday weekly
+        status: "Unverified"
+    symbols:
+      yfinance: "^BSESN"
+      angelone:
+        symbol: "SENSEX"
+        exchange: "BSE"
+        instrument_type: "INDEX"
+      upstox: "BSE_INDEX|SENSEX"
+
+vix:
+  name: "INDIA VIX"
+  exchange: "NSE"
+  symbols:
+    yfinance: "^INDIAVIX"
+    angelone:
+      symbol: "INDIA VIX"
+      exchange: "NSE"
+      instrument_type: "AMXIDX"
+    upstox: "NSE_INDEX|India VIX"
+
+data_cleaning:
+  outlier_std_threshold: 4.5    # Flag candle if return exceeds N rolling standard deviations
+  outlier_rolling_window: 20
+  fill_missing_policy: "none"   # Flag missing candles; do not forward-fill price bars silently
+  validate_high_low: true       # Ensure High >= max(Open, Close) and Low <= min(Open, Close)
+
+# Transaction cost parameters for Index Futures Proxy
+# DISCLAIMER & NOTES:
+# 1. Costs apply strictly to index futures (tradable proxy).
+# 2. SENSEX derivatives prior to 2023 relaunch are hypothetical / back-extended.
+# 3. UNIT CONVENTION: All percentage fields use raw percentage points where 1.0 = 1% (e.g., 0.02 = 0.02%, 18.0 = 18.0%).
+# Cost multiplier formula: cost_amount = notional_turnover * (rate_pct / 100.0)
+cost_parameters:
+  slippage:
+    base_bps: 1.5              # Base case: 1.5 bps per side
+    stress_bps: 5.0            # Stress case: 5.0 bps per side
+  default_brokerage_per_order: 20.0 # Flat INR 20 per executed order (discount brokerage model)
+
+cost_schedules:
+  # Effective-dated statutory and exchange costs for index futures
+  - effective_from: "2010-01-01"
+    stt_sell_pct: 0.017
+    stt_status: "Verified"     # Finance Act 2008 / Chapter VII Finance (No.2) Act 2004
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Unverified" # Pre-2020: State-specific; 0.002% is representative Maharashtra rate
+    exchange_pct: 0.0020
+    exchange_status: "Estimated" # Pre-Oct-2024 exchange charges varied across turnover slabs
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 10.3              # Service Tax (10% + 3% Edu Cess)
+    gst_status: "Verified"     # Finance Act 2010
+    brokerage_per_order: 20.0
+    brokerage_status: "Assumption" # Flat Rs 20 discount brokerage assumed prior to 2015
+
+  - effective_from: "2012-04-01"
+    stt_sell_pct: 0.017
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Unverified"
+    exchange_pct: 0.0020
+    exchange_status: "Estimated"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 12.36             # Finance Act 2012 (12% + 3% Edu Cess = 12.36%)
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Assumption"
+
+  - effective_from: "2013-06-01"
+    stt_sell_pct: 0.010
+    stt_status: "Unverified"   # Finance Act 2013 reduction to 0.01% (effective date cited without full gazette circular)
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Unverified"
+    exchange_pct: 0.0019
+    exchange_status: "Estimated" # NSE index futures baseline slab
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 12.36
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Assumption"
+
+  - effective_from: "2015-06-01"
+    stt_sell_pct: 0.010
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Unverified"
+    exchange_pct: 0.0019
+    exchange_status: "Estimated"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 14.0              # Finance Act 2015 Service Tax
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Verified" # Standard discount brokerage flat fee widely available
+
+  - effective_from: "2015-11-15"
+    stt_sell_pct: 0.010
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Unverified"
+    exchange_pct: 0.0019
+    exchange_status: "Estimated"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 14.5              # Service Tax + Swachh Bharat Cess 0.5%
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Verified"
+
+  - effective_from: "2016-06-01"
+    stt_sell_pct: 0.010
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Unverified"
+    exchange_pct: 0.0019
+    exchange_status: "Estimated"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 15.0              # Service Tax + KKC 0.5%
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Verified"
+
+  - effective_from: "2017-07-01"
+    stt_sell_pct: 0.010
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Unverified"
+    exchange_pct: 0.0019
+    exchange_status: "Estimated"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 18.0              # Central Goods and Services Tax Act 2017 (18% GST)
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Verified"
+
+  - effective_from: "2020-07-01"
+    stt_sell_pct: 0.010
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002  # Indian Stamp Act amendment: Uniform national rate of 0.002% on Buy
+    stamp_duty_status: "Verified"
+    exchange_pct: 0.0019
+    exchange_status: "Estimated"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 18.0
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Verified"
+
+  - effective_from: "2023-04-01"
+    stt_sell_pct: 0.0125       # Finance Act 2023: 25% hike on futures STT (0.010% -> 0.0125%)
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Verified"
+    exchange_pct: 0.0019
+    exchange_status: "Estimated"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 18.0
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Verified"
+
+  - effective_from: "2024-10-01"
+    stt_sell_pct: 0.020        # Finance (No. 2) Act 2024: STT doubled to 0.020%
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Verified"
+    exchange_pct: 0.00173      # SEBI True-to-Label circular / NSE revised flat rate 0.00173%
+    exchange_status: "Verified"
+    ipft_pct: 0.00010          # NSE Investor Protection Fund Trust charge (0.00010% / Rs 10 per crore)
+    ipft_status: "Verified"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 18.0
+    gst_status: "Verified"
+    brokerage_per_order: 20.0
+    brokerage_status: "Verified"
+
+  - effective_from: "2026-04-01"
+    stt_sell_pct: 0.050        # Budget 2026 / Finance Act: Futures STT revised to 0.050% on sell side
+    stt_status: "Verified"
+    stamp_duty_buy_pct: 0.002
+    stamp_duty_status: "Verified"
+    exchange_pct: 0.00173      # Flat NSE tariff circular
+    exchange_status: "Verified"
+    ipft_pct: 0.00010          # Investor Protection Fund Trust charge
+    ipft_status: "Verified"
+    sebi_turnover_pct: 0.0001
+    sebi_status: "Verified"
+    gst_pct: 18.0
+    gst_status: "Verified"
+    brokerage_per_order: 20.0  # User trading account flat discount brokerage
+    brokerage_status: "Verified"
+
+# Options model and Greeks parameters
+options_model:
+  risk_free_rate_pct: 6.5      # Annualized RBI 91-day T-Bill risk-free rate
+  forward_price_model: "spot_cost_of_carry" # F = S * exp(r * T) or active nearest future
+  sensex_greeks_method: "black76" # Analytical Black-76 (since Angel optionGreek does not support BFO)
+  atm_strike_window: 10        # ATM +/- 10 strikes recorded per expiry
+  stt_options_premium_pct: 0.15 # 0.15% STT on options premium turnover on sell side
+
+backtest:
+  starting_capital: 1000000.0  # INR 10 Lakhs initial capital
+  risk_per_trade_pct: 1.0      # Risk 1.0% of portfolio equity per trade
+  volatility_target_annual_pct: 15.0 # Annualized target volatility for vol-scaling
+  max_daily_loss_pct: 2.5      # Daily drawdown limit (halts entries for remainder of day)
+  max_drawdown_limit_pct: 15.0 # Portfolio drawdown kill switch
+  kill_switch_pause_days: 20   # Resume trading after 20 days pause
+  execution:
+    signal_bar: "close"
+    entry_bar: "next_open"
+    fill_gaps_at_open: true    # If next open is beyond stop/target, fill at open price
+
+walk_forward:
+  burn_in_bars: 252            # Drop first 252 bars for GARCH/HMM warm-up
+  train_start: "2011-01-17"
+  validation_end: "2024-10-31"
+  holdout_start: "2024-11-01"
+  holdout_end: "2026-10-23"
+  holdout_guard_file: "backtest/holdout_eval_guard.json"
+  test_step_months: 12
+  purge_bars: 10               # Purge last 10 bars of train to prevent triple-barrier label overlap
+  embargo_bars: 5              # 5-bar embargo after test fold
+  calibration_slice_pct: 0.20  # Last 20% of train window reserved for calibration
+  calibration_purge_bars: 10   # Purge 10 bars between train sub-split and calibration slice
+
+gating_hyperparameters:
+  confidence_thresholds: [0.52, 0.55, 0.58, 0.62]
+  vix_percentile_cutoffs: [80.0, 85.0, 90.0]
+  regime_filter_options: [true, false]
+  expiry_filter_options: [true, false] # A/B test option
+
+features:
+  trend:
+    ema_periods: [9, 21, 50, 200]
+    adx_period: 14
+    supertrend:
+      period: 10
+      multiplier: 3.0
+    hh_hl_window: 5
+  momentum:
+    rsi_period: 14
+    macd:
+      fast: 12
+      slow: 26
+      signal: 9
+    roc_period: 10
+    stochastic:
+      k_period: 14
+      d_period: 3
+    returns_zscore_window: 20
+  volatility:
+    atr_period: 14
+    bollinger:
+      period: 20
+      num_std: 2.0
+    realized_vol_window: 20
+    garch:
+      p: 1
+      q: 1
+      fit_window: 252           # Rolling window size for GARCH(1,1) one-step forecast
+      refit_step: 10            # Periodicity to refit GARCH parameter estimates
+    vix_percentile_window: 252
+  mean_reversion:
+    distance_ma_period: 20
+    hurst_window: 100
+    adf_window: 60
+  regime:
+    method: "hmm"               # "hmm" or "rolling_stats"
+    hmm_states: 3               # 3 states: TRENDING, RANGING, HIGH_VOL
+    fit_window: 252             # Rolling/expanding window for HMM fitting
+    refit_step: 20              # Periodicity to refit transition matrix to prevent leakage
+    rolling_vol_window: 20
+    rolling_adx_threshold: 25.0
+
+labels:                         # Future target generation (for Part 2 modeling; strictly separate)
+  return_horizons: [1, 3, 5]    # Next N-bar return directions (-1, 0, 1)
+  triple_barrier:
+    pt_atr_mult: 2.0            # Profit-take barrier in ATR multiples
+    sl_atr_mult: 1.5            # Stop-loss barrier in ATR multiples
+    time_limit_bars: 10         # Maximum holding duration in bars before vertical barrier exit

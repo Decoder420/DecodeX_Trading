@@ -1,0 +1,38 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment variables & secrets
+.env
+*.env
+data/cache/*token*
+data/cache/groww_*
+*.token*
+
+
+# Data storage & local database
+*.duckdb
+*.duckdb.wal
+*.db
+*.sqlite
+*.sqlite3
+data/*.duckdb*
+data/*.db
+data/cache/
+
+# Logs & temp files
+logs/
+*.log
+data/live/
+.DS_Store
+
+# Distribution / Build
+dist/
+build/
+*.egg-info/
+node_modules/

@@ -184,3 +184,46 @@ def test_signal_engine_real_greeks_option_pricing():
     assert plan.contract_expiry == "03NOV2026"
     assert plan.option_stop_loss < 185.0
     assert plan.option_target_1 > 185.0
+
+
+def test_freenews_api_parsing_and_fallback(monkeypatch):
+    """Verify FreeNewsAPI.io parses real-time headlines with Indian market context and falls back gracefully."""
+    import json
+    from signals.macro_sentiment import MacroSentimentEngine
+
+    engine = MacroSentimentEngine()
+    fake_json = {
+        "data": [
+            {
+                "uuid": "fake-1",
+                "title": "Brent Crude Falls Below $90 Providing Major Relief to Indian Markets",
+                "published_at": "2026-11-10T10:00:00.000Z",
+                "publisher": "The Economic Times"
+            },
+            {
+                "uuid": "fake-2",
+                "title": "FII Selling Eases as IT Stocks Jump on Strong Earnings",
+                "published_at": "2026-11-10T10:15:00.000Z",
+                "publisher": "BusinessLine"
+            }
+        ]
+    }
+
+    class MockResp:
+        def read(self):
+            return json.dumps(fake_json).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda req, timeout=5: MockResp())
+    headlines, score, topics = engine._fetch_freenews_api("mock_key")
+
+    assert len(headlines) == 2
+    assert headlines[0].source == "The Economic Times (FreeNewsAPI)"
+    assert headlines[0].sentiment == "BULLISH"
+    assert "IST" in headlines[0].published
+    assert score > 0.0
+    assert topics["Crude Oil"] == 1
+    assert topics["FPI / FII Flows"] == 1

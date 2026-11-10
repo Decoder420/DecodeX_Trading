@@ -73,7 +73,10 @@ class StorageManager:
         table_name = self._format_table_name(symbol, timeframe)
 
         if self.backend == "duckdb":
-            con = duckdb.connect(str(self.db_path))
+            try:
+                con = duckdb.connect(str(self.db_path), read_only=True)
+            except Exception:
+                con = duckdb.connect(str(self.db_path))
             try:
                 tables = con.execute("SHOW TABLES").fetchall()
                 table_names = [t[0] for t in tables]
@@ -117,7 +120,10 @@ class StorageManager:
         table_name = self._format_table_name(symbol, timeframe)
 
         if self.backend == "duckdb":
-            con = duckdb.connect(str(self.db_path))
+            try:
+                con = duckdb.connect(str(self.db_path), read_only=True)
+            except Exception:
+                con = duckdb.connect(str(self.db_path))
             try:
                 tables = con.execute("SHOW TABLES").fetchall()
                 table_names = [t[0] for t in tables]
@@ -160,7 +166,10 @@ class StorageManager:
         """Collect the union of all trading dates observed across all stored instruments."""
         all_dates: set[date] = set()
         if self.backend == "duckdb":
-            con = duckdb.connect(str(self.db_path))
+            try:
+                con = duckdb.connect(str(self.db_path), read_only=True)
+            except Exception:
+                con = duckdb.connect(str(self.db_path))
             try:
                 tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
                 for t in tables:
@@ -318,7 +327,10 @@ class StorageManager:
         table_name = self._format_table_name(symbol, timeframe)
 
         if self.backend == "duckdb":
-            con = duckdb.connect(str(self.db_path))
+            try:
+                con = duckdb.connect(str(self.db_path), read_only=True)
+            except Exception:
+                con = duckdb.connect(str(self.db_path))
             try:
                 tables = con.execute("SHOW TABLES").fetchall()
                 if table_name not in [t[0] for t in tables]:

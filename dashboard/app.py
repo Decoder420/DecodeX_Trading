@@ -1113,18 +1113,36 @@ with tab_cockpit:
             )
 
             # Live Indian Financial News Feed
-            st.markdown("##### 📰 Real-Time Indian Market & Macro Financial News")
+            st.markdown(
+                """<div style="display: flex; align-items: center; justify-content: space-between; margin-top: 15px; margin-bottom: 8px;">
+                    <span style="font-weight: 700; font-size: 16px; color: #E2E8F0;">📰 Real-Time Indian Market & Macro Financial News</span>
+                    <span style="background: rgba(0, 230, 118, 0.12); border: 1px solid #00E676; color: #00E676; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 12px; display: flex; align-items: center; gap: 6px;">
+                        <span style="width: 7px; height: 7px; background: #00E676; border-radius: 50%; box-shadow: 0 0 6px #00E676; display: inline-block;"></span>
+                        FreeNewsAPI.io Live Feed
+                    </span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
             news_items = macro_report_now.headlines
             if news_items:
+                b_count = sum(1 for n in news_items if n.sentiment == "BULLISH")
+                br_count = sum(1 for n in news_items if n.sentiment == "BEARISH")
+                nt_count = len(news_items) - b_count - br_count
+
+                ncol1, ncol2, ncol3, ncol4 = st.columns(4)
+                ncol1.metric("Live Headlines", f"{len(news_items)} Articles")
+                ncol2.metric("Bullish Catalysts", f"{b_count}", delta=f"{b_count} Positive", delta_color="normal")
+                ncol3.metric("Bearish Overhangs", f"{br_count}", delta=f"-{br_count} Negative" if br_count else "0", delta_color="inverse")
+                ncol4.metric("Domestic News Sentiment", f"{macro_report_now.news_sentiment_score:+.2f}")
+
                 news_rows = []
                 for n in news_items:
-                    sent_color = "#00E676" if n.sentiment == "BULLISH" else ("#FF5252" if n.sentiment == "BEARISH" else "#94A3B8")
                     news_rows.append({
                         "Sentiment": f"{'🟢' if n.sentiment == 'BULLISH' else ('🔴' if n.sentiment == 'BEARISH' else '⚪')} {n.sentiment}",
                         "Headline": n.title,
                         "Source": n.source,
-                        "Published": n.published,
-                        "Detected Keywords": ", ".join(n.keywords) if n.keywords else "—",
+                        "Published (IST)": n.published,
+                        "Detected Catalysts": ", ".join(n.keywords) if n.keywords else "—",
                     })
                 st.dataframe(pd.DataFrame(news_rows), use_container_width=True, hide_index=True)
             else:

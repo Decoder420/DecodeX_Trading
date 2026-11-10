@@ -354,8 +354,149 @@ class MacroSentimentEngine:
         macro_score = max(-1.0, min(1.0, macro_score))
         return quotes, macro_score
 
+    def _fetch_freenews_api(self, api_key: str) -> Tuple[List[NewsHeadline], float, Dict[str, int]]:
+        """Fetch real-time Indian & global market headlines via FreeNewsAPI.io."""
+        url = "https://api.freenewsapi.io/v1/news?language=en&country=in&topic=business&order_by=recent&page_size=15"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "x-api-key": api_key,
+                "User-Agent": "Mozilla/5.0 (VedicQuantCockpit/2.0)"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+
+        headlines: List[NewsHeadline] = []
+        scores: List[float] = []
+        topic_counts: Dict[str, int] = {
+            "Crude Oil": 0,
+            "FPI / FII Flows": 0,
+            "Earnings & Dividends": 0,
+            "RBI & Rates": 0,
+            "Global Markets & Trade": 0,
+            "Auto & Tech Sector": 0,
+        }
+
+        articles = data.get("data", [])
+        import pytz
+        for item in articles:
+            raw_title = str(item.get("title", "")).strip()
+            if not raw_title:
+                continue
+            publisher = str(item.get("publisher", "Financial Press")).strip()
+            dt_str = str(item.get("published_at", "")).strip()
+
+            # Format published date to Indian Standard Time (IST)
+            if dt_str:
+                try:
+                    utc_dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                    ist_dt = utc_dt.astimezone(pytz.timezone("Asia/Kolkata"))
+                    pub_formatted = ist_dt.strftime("%d %b %H:%M IST")
+                except Exception:
+                    pub_formatted = dt_str[:16]
+            else:
+                pub_formatted = "Today"
+
+            lower_title = raw_title.lower()
+            words = set(re.findall(r"\b[a-z]+\b", lower_title))
+            bull_hits = words.intersection(BULLISH_KEYWORDS)
+            bear_hits = words.intersection(BEARISH_KEYWORDS)
+
+            base_score = len(bull_hits) * 0.35 - len(bear_hits) * 0.35
+
+            # Context-aware adjustments for Indian economy:
+            # 1. Falling crude is BULLISH for Indian equity import bills
+            if ("crude" in lower_title or "oil" in lower_title) and any(w in lower_title for w in ["fall", "falls", "drop", "drops", "slips", "lowest", "cooling", "eases"]):
+                base_score += 0.40
+                bull_hits.add("crude cooling")
+            elif ("crude" in lower_title or "oil" in lower_title) and any(w in lower_title for w in ["surge", "surges", "spikes", "rises", "climbs", "high"]):
+                base_score -= 0.40
+                bear_hits.add("crude spike")
+
+            # 2. FII buying vs selling
+            if "fii" in lower_title or "fpi" in lower_title:
+                if any(w in lower_title for w in ["ease", "eases", "buy", "buys", "inflow", "inflows"]):
+                    base_score += 0.35
+                    bull_hits.add("fii inflow/easing")
+                elif any(w in lower_title for w in ["sell", "selling", "outflow", "outflows", "dump"]):
+                    base_score -= 0.35
+                    bear_hits.add("fii outflows")
+
+            # 3. Dividends and quarterly results
+            if any(k in lower_title for k in ["dividend", "interim dividend", "profit jumps", "profit surges"]):
+                base_score += 0.30
+                bull_hits.add("dividend/profit")
+            elif any(k in lower_title for k in ["profit falls", "profit halves", "loss", "pat down"]):
+                base_score -= 0.30
+                bear_hits.add("earnings drop")
+
+            score = max(-1.0, min(1.0, base_score))
+
+            if score >= 0.15:
+                sent = "BULLISH"
+            elif score <= -0.15:
+                sent = "BEARISH"
+            else:
+                sent = "NEUTRAL"
+
+            # Track key catalysts
+            if "crude" in lower_title or "oil" in lower_title:
+                topic_counts["Crude Oil"] += 1
+            if "fpi" in lower_title or "fii" in lower_title or "foreign" in lower_title:
+                topic_counts["FPI / FII Flows"] += 1
+            if any(k in lower_title for k in ["profit", "result", "results", "pat", "q2", "q3", "dividend"]):
+                topic_counts["Earnings & Dividends"] += 1
+            if any(k in lower_title for k in ["rbi", "repo", "inflation", "cpi", "rate"]):
+                topic_counts["RBI & Rates"] += 1
+            if any(k in lower_title for k in ["fed", "war", "trump", "china", "nasdaq", "wall street"]):
+                topic_counts["Global Markets & Trade"] += 1
+            if any(k in lower_title for k in ["auto", "tech", "nvidia", "tata", "mrf", "qantas"]):
+                topic_counts["Auto & Tech Sector"] += 1
+
+            headlines.append(
+                NewsHeadline(
+                    title=raw_title,
+                    source=f"{publisher} (FreeNewsAPI)",
+                    published=pub_formatted,
+                    sentiment=sent,
+                    score=round(score, 2),
+                    keywords=list(bull_hits.union(bear_hits)),
+                )
+            )
+            scores.append(score)
+
+        avg_score = round(float(sum(scores) / max(len(scores), 1)), 3) if scores else 0.0
+        return headlines, avg_score, topic_counts
+
     def _fetch_indian_news(self) -> Tuple[List[NewsHeadline], float, List[str]]:
-        """Fetch real-time Indian stock market headlines via RSS and score sentiment."""
+        """Fetch real-time Indian stock market headlines via FreeNewsAPI.io with RSS/Finnhub fallback."""
+        headlines: List[NewsHeadline] = []
+        scores: List[float] = []
+        topic_counts: Dict[str, int] = {
+            "Crude Oil": 0,
+            "FPI / FII Flows": 0,
+            "Earnings & Dividends": 0,
+            "RBI & Rates": 0,
+            "Global Markets & Trade": 0,
+            "Auto & Tech Sector": 0,
+        }
+
+        # 1. Primary: FreeNewsAPI.io (Live structured Indian market news)
+        freenews_key = os.getenv("FREENEWS_API_KEY", "").strip()
+        if freenews_key:
+            try:
+                headlines, news_score, freenews_topics = self._fetch_freenews_api(freenews_key)
+                if headlines:
+                    key_drivers = [t for t, c in sorted(freenews_topics.items(), key=lambda x: x[1], reverse=True) if c > 0]
+                    if not key_drivers:
+                        key_drivers = ["Crude Oil Cooling", "FII Selling Easing", "Q2 Corporate Earnings"]
+                    return headlines, news_score, key_drivers
+            except Exception as fn_err:
+                logger.warning("FreeNewsAPI.io fetch failed: %s. Falling back to RSS/Finnhub...", fn_err)
+                headlines = []
+
+        # 2. Secondary fallback: Google RSS
         url = "https://news.google.com/rss/search?q=NIFTY+Indian+stock+market+when:1d&hl=en-IN&gl=IN&ceid=IN:en"
         headlines: List[NewsHeadline] = []
         scores: List[float] = []
@@ -484,7 +625,7 @@ class MacroSentimentEngine:
         """Synthesize an institutional confluence breakdown."""
         nasdaq = quotes.get("^IXIC")
         crude = quotes.get("BZ=F")
-        vix = quotes.get("^INDIAVIX")
+        vix = quotes.get("INDIA_VIX") or quotes.get("^INDIAVIX")
 
         points = []
         if nasdaq:

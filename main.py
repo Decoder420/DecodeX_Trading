@@ -15,21 +15,34 @@ Role:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("DecodeXTerminal")
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Ensure Qt plugin path on macOS
+# Ensure Qt plugin path and remove macOS hidden file flags
 qt_plugins = PROJECT_ROOT / ".venv" / "lib" / "python3.12" / "site-packages" / "PyQt6" / "Qt6" / "plugins"
 if qt_plugins.exists():
-    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(qt_plugins)
+    # Remove macOS UF_HIDDEN attribute that pip wheels sometimes set
+    if sys.platform == "darwin":
+        import subprocess
+        try:
+            subprocess.run(["chflags", "-R", "0", str(qt_plugins)], capture_output=True)
+            subprocess.run(["xattr", "-rc", str(qt_plugins)], capture_output=True)
+        except Exception:
+            pass
+    os.environ["QT_PLUGIN_PATH"] = str(qt_plugins)
+    if "QT_QPA_PLATFORM_PLUGIN_PATH" in os.environ:
+        del os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"]
 
 import numpy as np
 import pyqtgraph as pg
@@ -58,7 +71,10 @@ from PyQt6.QtWidgets import (
 from worker import DecodeXDataWorker
 
 # Configure PyQtGraph global options for ultra-low latency & Apple Silicon Metal/OpenGL
-pg.setConfigOptions(useOpenGL=True, antialias=True)
+try:
+    pg.setConfigOptions(useOpenGL=True, antialias=True)
+except Exception:
+    pg.setConfigOptions(useOpenGL=False, antialias=True)
 pg.setConfigOption("background", "#0B0E14")
 pg.setConfigOption("foreground", "#E2E8F0")
 
@@ -121,6 +137,8 @@ class CandlestickItem(pg.GraphicsObject):
         painter.drawPicture(0, 0, self.picture)
 
     def boundingRect(self) -> QtCore.QRectF:
+        if not self.data:
+            return QtCore.QRectF(0, 0, 1, 1)
         return QtCore.QRectF(self.picture.boundingRect())
 
 
@@ -756,6 +774,10 @@ def main() -> None:
     if hasattr(QtCore.Qt.ApplicationAttribute, "AA_UseHighDpiPixmaps"):
         QApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
 
+    if qt_plugins.exists():
+        QtCore.QCoreApplication.addLibraryPath(str(qt_plugins))
+        QtCore.QCoreApplication.addLibraryPath(str(qt_plugins / "platforms"))
+
     app = QApplication(sys.argv)
     app.setApplicationName("DecodeX Trading")
     app.setOrganizationName("DecodeX")
@@ -768,3 +790,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

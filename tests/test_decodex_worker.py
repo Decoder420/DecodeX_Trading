@@ -64,3 +64,4 @@ def test_decodex_worker_mtf_confluence_strict_lock():
     assert "confluence" in data
     assert "signal" in data["confluence"]
     assert "reasons" in data["confluence"]
+

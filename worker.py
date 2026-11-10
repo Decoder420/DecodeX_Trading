@@ -125,6 +125,8 @@ class DecodeXDataWorker(QThread):
 
     def _warmup_historical_bars(self) -> None:
         """Warm up 15m and 3m rolling buffers from DuckDB market storage."""
+        self.bars_15m.clear()
+        self.bars_3m.clear()
         try:
             from data.storage import StorageManager
             sm = StorageManager()
@@ -664,20 +666,13 @@ class DecodeXDataWorker(QThread):
                     f"Data Stale ({int(elapsed)}s) | Attempt #{self.retry_attempt} in {int(backoff_delay)}s..."
                 )
 
-                # Graceful disconnect
+                # Signal websocket to disconnect so run_forever unblocks
                 try:
                     if self.ws:
                         self.ws.close_connection()
                 except Exception:
                     pass
-
-                time.sleep(backoff_delay)
-
-                # Reconnect
-                try:
-                    self._connect_websocket()
-                except Exception as rec_err:
-                    logger.error("Reconnection attempt failed: %s", rec_err)
+                self.last_tick_time = time.time()
 
     # =========================================================================
     # TECHNICAL INDICATOR MATHEMATICS
@@ -773,16 +768,22 @@ class DecodeXDataWorker(QThread):
         watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True, name="DecodeXWatchdog")
         watchdog_thread.start()
 
-        # Connect WebSocket (blocks this QThread or runs its own event dispatch)
-        try:
-            self._connect_websocket()
-        except Exception as conn_err:
-            logger.error("Initial WebSocket connection error: %s", conn_err)
-            self.connection_status_signal.emit("ERROR", f"Connection failed: {str(conn_err)[:45]}")
-
-        # Keep thread alive if WebSocket runs in background
+        # Continuous Connection & Backoff Reconnect Loop
         while self._is_running:
-            time.sleep(0.5)
+            try:
+                self._connect_websocket()
+            except Exception as conn_err:
+                logger.error("WebSocket connection error: %s", conn_err)
+                self.connection_status_signal.emit("ERROR", f"Connection error: {str(conn_err)[:45]}")
+
+            if not self._is_running:
+                break
+
+            self.retry_attempt += 1
+            delay = min(60.0, 2.0 * (2 ** min(self.retry_attempt, 5))) + random.uniform(0.5, 1.5)
+            logger.info("WebSocket disconnected. Auto-reconnecting in %.1fs (attempt #%d)...", delay, self.retry_attempt)
+            self.connection_status_signal.emit("RECONNECTING", f"Attempt #{self.retry_attempt} in {int(delay)}s...")
+            time.sleep(delay)
 
     def stop(self) -> None:
         """Gracefully stop worker thread and close connections."""
@@ -795,3 +796,4 @@ class DecodeXDataWorker(QThread):
         self.quit()
         self.wait(2000)
         logger.info("DecodeXDataWorker background thread stopped.")
+

@@ -5,8 +5,11 @@ import pytest
 import pandas as pd
 
 from dashboard.options_chain import get_available_expiries, load_options_chain_data
+from recorder.engine import LiveRecorderEngine
+from recorder.storage import LiveStorageManager
 from signals.macro_sentiment import shared_macro_engine, ConfluenceReport
 from signals.engine import IntradaySignalEngine, SignalState, TradeAction, TradePlan
+
 
 
 def test_dynamic_expiries_nifty_future_only():
@@ -49,6 +52,36 @@ def test_options_chain_data_loader_structure():
     assert 0.40 <= abs(chain["atm_call_delta"]) <= 0.65
     assert -0.65 <= chain["atm_put_delta"] <= -0.40
     assert chain["daily_theta_cost_inr"] > 0
+
+    # Live exchange telemetry metadata check
+    assert "feed_type" in chain
+    assert "feed_badge_color" in chain
+    assert "last_option_tick_time" in chain
+    assert "is_synthetic" in chain
+    assert chain["is_synthetic"] is False
+    assert "Live NFO" in chain["feed_type"]
+    assert chain["real_strikes_count"] > 0
+
+
+def test_recorder_option_tokens_subscription(tmp_path):
+    """Verify LiveRecorderEngine resolves 30 active NFO option tokens (ATM ± 7) and maps symbols."""
+    storage = LiveStorageManager(base_dir=str(tmp_path / "live"))
+    recorder = LiveRecorderEngine(storage_mgr=storage)
+    
+    tokens = recorder._resolve_active_option_tokens("NIFTY", window_strikes=7)
+    assert len(tokens) == 30  # 15 CE + 15 PE
+    
+    assert len(recorder.option_tokens_meta) == 30
+    for tok, meta in recorder.option_tokens_meta.items():
+        assert meta["symbol"].startswith("NIFTY")
+        assert meta["instrument_type"] == "OPTIDX"
+        assert meta["option_type"] in ["CE", "PE"]
+        assert meta["strike"] > 0
+        
+        # Verify symbol and instrument mapping
+        sym, itype = recorder._token_to_symbol(tok)
+        assert sym == meta["symbol"]
+        assert itype == "OPTIDX"
 
 
 def test_macro_sentiment_engine_report():

@@ -113,3 +113,72 @@ def test_secrets_scanner_detects_credentials(tmp_path: Path):
     # Leak scan
     rep_leak = downloader._run_secrets_scan([leak_file])
     assert "CRITICAL: LEAKS DETECTED" in rep_leak.read_text()
+
+
+def test_unauthorized_writer_to_market_data_blocked():
+    """Verify any non-downloader writer attempting to write to market_data.duckdb raises PermissionError."""
+    import pandas as pd
+    from data.storage import StorageManager
+
+    storage = StorageManager()
+    assert storage.db_path.name == "market_data.duckdb"
+
+    df = pd.DataFrame([
+        {
+            "timestamp": "2026-10-28 09:15:00+05:30",
+            "open": 22500.0,
+            "high": 22550.0,
+            "low": 22480.0,
+            "close": 22520.0,
+            "volume": 12345.0,
+        }
+    ])
+
+    with pytest.raises(PermissionError) as exc_info:
+        storage.save_ohlcv(df, "NIFTY", "1d")
+
+    assert "UNAUTHORIZED WRITER GUARD" in str(exc_info.value)
+    assert "Only data.historical_downloader is permitted" in str(exc_info.value)
+
+
+def test_authorized_downloader_writer_allowed_and_zero_volume_enforced(tmp_path: Path):
+    """Verify DownloaderWriteGuard permits write and enforces volume=0 for index instruments."""
+    import duckdb
+    import pandas as pd
+    from data.storage import StorageManager, DownloaderWriteGuard
+    from config.loader import ConfigManager
+
+    # Test with custom db_path set to market_data.duckdb inside tmp_path
+    custom_db = tmp_path / "market_data.duckdb"
+    cfg = ConfigManager()
+    cfg.config["data"]["storage"]["duckdb_path"] = str(custom_db)
+
+    storage = StorageManager(cfg=cfg)
+    assert storage.db_path.name == "market_data.duckdb"
+
+    # Unauthorized call must fail
+    df = pd.DataFrame([
+        {
+            "timestamp": "2026-10-28 09:15:00+05:30",
+            "open": 22600.0,
+            "high": 22650.0,
+            "low": 22580.0,
+            "close": 22620.0,
+            "volume": 50000.0,  # Non-zero volume provided
+        }
+    ])
+
+    with pytest.raises(PermissionError):
+        storage.save_ohlcv(df, "NIFTY", "1d")
+
+    # Authorized call under DownloaderWriteGuard must succeed
+    with DownloaderWriteGuard():
+        saved = storage.save_ohlcv(df, "NIFTY", "1d")
+        assert saved == 1
+
+    # Verify DuckDB table has volume forced to 0.0 for index
+    con = duckdb.connect(str(custom_db), read_only=True)
+    res = con.execute("SELECT volume FROM ohlcv_nifty_1d").fetchone()
+    con.close()
+    assert res is not None
+    assert res[0] == 0.0, f"Index volume must be strictly 0.0, got {res[0]}"

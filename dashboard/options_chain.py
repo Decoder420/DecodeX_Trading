@@ -24,6 +24,7 @@ logger = logging.getLogger("OptionsChainProvider")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SCRIP_CACHE_PATH = ROOT_DIR / "data" / "cache" / "angel_scrip_master.json"
+DEFAULT_LIVE_DIR = ROOT_DIR / "data" / "live"
 
 STRIKE_STEPS = {
     "NIFTY": 50.0,
@@ -125,19 +126,69 @@ def load_options_chain_data(
     T_years = diff_hours / (365.0 * 24.0)
     r = 0.065  # 6.5% risk-free rate
 
-    # Check live DuckDB database for today
+    # Check live DuckDB database for today or most recent session with options_snapshots
     session_date = now.strftime("%Y_%m_%d")
-    db_path = ROOT_DIR / "data" / "live" / f"live_{session_date}.duckdb"
+    target_dbs = [ROOT_DIR / "data" / "live" / f"live_{session_date}.duckdb"]
+    live_files = sorted(list((ROOT_DIR / "data" / "live").glob("live_*.duckdb")), reverse=True)
+    for lf in live_files:
+        if lf not in target_dbs:
+            target_dbs.append(lf)
+
+    db_path = None
+    for p in target_dbs:
+        if p.exists():
+            try:
+                con_chk = duckdb.connect(str(p), read_only=True)
+                tables = [r[0] for r in con_chk.execute("SHOW TABLES").fetchall()]
+                con_chk.close()
+                if "options_snapshots" in tables:
+                    db_path = p
+                    break
+            except Exception:
+                pass
+    if db_path is None:
+        db_path = target_dbs[0]
     
     rows_by_strike: Dict[float, Dict[str, Any]] = {k: {"CE": None, "PE": None} for k in target_strikes}
     all_chain_rows: List[Dict[str, Any]] = []
+    latest_ts = None
+    has_live_ticks = False
+
+    def _to_naive_ist(val: Any) -> Optional[pd.Timestamp]:
+        if val is None or pd.isna(val):
+            return None
+        try:
+            ts = pd.to_datetime(val)
+            if ts.tz is not None:
+                ts = ts.tz_convert("Asia/Kolkata").tz_localize(None)
+            return ts
+        except Exception:
+            return None
+
+    # 1. Check in-memory live state JSON for active options streaming
+    state_path = DEFAULT_LIVE_DIR / "live_state.json"
+    live_quotes: Dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+            if state_data.get("has_live"):
+                live_quotes = state_data.get("latest_option_quotes", {})
+                raw_opt_ts = state_data.get("last_option_tick_time") or state_data.get("timestamp")
+                if raw_opt_ts:
+                    parsed_state_ts = _to_naive_ist(raw_opt_ts)
+                    if parsed_state_ts is not None:
+                        latest_ts = parsed_state_ts
+                        has_live_ticks = True
+        except Exception as e:
+            logger.debug("Failed reading live_state.json for options: %s", e)
 
     if db_path.exists():
         try:
             conn = duckdb.connect(str(db_path), read_only=True)
             exp_date_str = exp_date.strftime("%Y-%m-%d")
             query = f"""
-                SELECT strike, option_type, ltp, oi, volume, iv, delta, gamma, theta, vega, greeks_source, timestamp
+                SELECT strike, option_type, token, ltp, oi, volume, iv, delta, gamma, theta, vega, greeks_source, timestamp
                 FROM options_snapshots
                 WHERE underlying = '{instrument}'
                   AND contract_expiry = '{exp_date_str}'
@@ -145,9 +196,38 @@ def load_options_chain_data(
                 ORDER BY timestamp DESC
             """
             df_snap = conn.execute(query).df()
+
+            # Check if live_ticks table has recent OPTIDX ticks
+            tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
+            df_ticks = pd.DataFrame()
+            if "live_ticks" in tables:
+                df_ticks = conn.execute("""
+                    SELECT token, symbol, ltp, volume, ltq, exchange_timestamp as timestamp
+                    FROM live_ticks
+                    WHERE instrument_type = 'OPTIDX'
+                    ORDER BY exchange_timestamp DESC
+                """).df()
+                if not df_ticks.empty:
+                    has_live_ticks = True
+                    tick_ts = _to_naive_ist(df_ticks["timestamp"].max())
+                    if tick_ts is not None and (latest_ts is None or tick_ts > latest_ts):
+                        latest_ts = tick_ts
+                else:
+                    # Check recent ticks from live feed for underlying
+                    u_row = conn.execute(f"""
+                        SELECT max(exchange_timestamp) FROM live_ticks
+                        WHERE symbol = '{instrument}'
+                    """).fetchone()
+                    if u_row and u_row[0] is not None:
+                        u_ts = _to_naive_ist(u_row[0])
+                        if u_ts is not None and (latest_ts is None or u_ts > latest_ts):
+                            latest_ts = u_ts
             conn.close()
 
             if not df_snap.empty:
+                snap_ts = _to_naive_ist(df_snap["timestamp"].max())
+                if latest_ts is None and snap_ts is not None:
+                    latest_ts = snap_ts
                 # Deduplicate to keep latest quote per strike and option_type
                 df_latest = df_snap.drop_duplicates(subset=["strike", "option_type"], keep="first")
                 for _, r_data in df_latest.iterrows():
@@ -156,52 +236,130 @@ def load_options_chain_data(
                     all_chain_rows.append(r_data.to_dict())
                     if k in rows_by_strike and otype in ["CE", "PE"]:
                         rows_by_strike[k][otype] = r_data.to_dict()
-        except Exception as e:
-            logger.warning("Error reading options_snapshots from DuckDB: %s", e)
 
-    # Populate any missing strikes using Black-76 theoretical model
+            if not df_ticks.empty:
+                df_ticks_latest = df_ticks.drop_duplicates(subset=["token"], keep="first")
+                token_dict = df_ticks_latest.set_index("token").to_dict(orient="index")
+                for k in target_strikes:
+                    for otype in ["CE", "PE"]:
+                        row = rows_by_strike[k][otype]
+                        if row and str(row.get("token")) in token_dict:
+                            t_data = token_dict[str(row["token"])]
+                            if float(t_data.get("ltp", 0.0)) > 0:
+                                row["ltp"] = float(t_data["ltp"])
+                                row["volume"] = int(t_data.get("volume", row.get("volume", 0)))
+                                row["greeks_source"] = "live_ws_tick"
+
+            if live_quotes:
+                has_live_ticks = True
+                for k in target_strikes:
+                    for otype in ["CE", "PE"]:
+                        row = rows_by_strike[k][otype]
+                        if row:
+                            t_str = str(row.get("token"))
+                            if t_str in live_quotes:
+                                q_data = live_quotes[t_str]
+                                if float(q_data.get("ltp", 0.0)) > 0:
+                                    row["ltp"] = float(q_data["ltp"])
+                                    row["volume"] = int(q_data.get("volume", row.get("volume", 0)))
+                                    if "oi" in q_data and int(q_data["oi"]) > 0:
+                                        row["oi"] = int(q_data["oi"])
+                                    row["greeks_source"] = "live_ws_tick"
+        except Exception as e:
+            logger.warning("Error reading options data from DuckDB: %s", e)
+
+    # Populate and validate strikes using actual market prices and inverted IV
+    real_strikes_count = 0
     for k in target_strikes:
         for otype in ["CE", "PE"]:
             existing = rows_by_strike[k][otype]
-            needs_calc = (
-                existing is None
-                or float(existing.get("ltp", 0.0)) <= 0.0
-                or float(existing.get("delta", 0.0)) == 0.0
+            has_real_quote = (
+                existing is not None
+                and float(existing.get("ltp", 0.0)) > 0.0
+                and int(existing.get("oi", 0)) > 0
             )
-            if needs_calc:
-                # Approximate baseline IV based on moneyness & VIX
+
+            if has_real_quote:
+                real_ltp = float(existing["ltp"])
+                real_oi = int(existing["oi"])
+                real_vol = int(existing.get("volume", 0))
+
+                # Check if existing broker Greeks are valid
+                raw_iv = float(existing.get("iv", 0.0))
+                raw_delta = float(existing.get("delta", 0.0))
+                src = str(existing.get("greeks_source", "broker_optionGreek"))
+
+                if raw_iv > 0.0 and raw_delta != 0.0 and src == "broker_optionGreek":
+                    iv = raw_iv if raw_iv > 1.0 else round(raw_iv * 100.0, 2)
+                    delta = raw_delta
+                    gamma = float(existing.get("gamma", 0.0))
+                    theta = float(existing.get("theta", 0.0))
+                    vega = float(existing.get("vega", 0.0))
+                    g_source = "broker_optionGreek"
+                else:
+                    # Invert Black-76 on the ACTUAL option market LTP
+                    computed_iv = Black76.implied_volatility(
+                        market_price=real_ltp,
+                        F=spot_price,
+                        K=k,
+                        T=T_years,
+                        r=r,
+                        option_type=otype,
+                    )
+                    if computed_iv > 0.001:
+                        b76_g = Black76.greeks(F=spot_price, K=k, T=T_years, r=r, sigma=computed_iv, option_type=otype)
+                        iv = round(computed_iv * 100.0, 2)
+                        delta = b76_g["delta"]
+                        gamma = b76_g["gamma"]
+                        theta = b76_g["theta"]
+                        vega = b76_g["vega"]
+                        g_source = "market_iv_inversion"
+                    else:
+                        iv = 16.0
+                        delta = 0.50 if otype == "CE" else -0.50
+                        gamma = 0.0008
+                        theta = -15.0
+                        vega = 10.0
+                        g_source = "boundary_fallback"
+
+                rows_by_strike[k][otype] = {
+                    "strike": k,
+                    "option_type": otype,
+                    "ltp": real_ltp,
+                    "oi": real_oi,
+                    "volume": real_vol,
+                    "iv": iv,
+                    "delta": delta,
+                    "gamma": gamma,
+                    "theta": theta,
+                    "vega": vega,
+                    "greeks_source": g_source,
+                    "is_real": True,
+                }
+                real_strikes_count += 1
+            else:
+                # Fallback to Black-76 theoretical pricing for missing strikes
                 moneyness = abs(spot_price - k) / spot_price
                 iv_est = max(0.12, min(0.35, 0.165 + moneyness * 0.40))
-                
-                # Black-76 theoretical pricing
                 b76_price = Black76.price(F=spot_price, K=k, T=T_years, r=r, sigma=iv_est, option_type=otype)
                 greeks = Black76.greeks(F=spot_price, K=k, T=T_years, r=r, sigma=iv_est, option_type=otype)
-
-                # Synthetic reasonable OI if missing
                 dist_factor = max(0.05, 1.0 - (abs(k - spot_price) / (step * 8)))
                 oi_synth = int(dist_factor * 4500000)
 
-                ltp_val = round(existing.get("ltp") if (existing and existing.get("ltp", 0) > 0) else b76_price, 2)
-                oi_val = int(existing.get("oi") if (existing and existing.get("oi", 0) > 0) else oi_synth)
-
-                row_dict = {
+                rows_by_strike[k][otype] = {
                     "strike": k,
                     "option_type": otype,
-                    "ltp": ltp_val,
-                    "oi": oi_val,
-                    "volume": int(oi_val * 0.75),
+                    "ltp": round(b76_price, 2),
+                    "oi": oi_synth,
+                    "volume": int(oi_synth * 0.75),
                     "iv": round(iv_est * 100.0, 2),
                     "delta": greeks["delta"],
                     "gamma": greeks["gamma"],
                     "theta": greeks["theta"],
                     "vega": greeks["vega"],
+                    "greeks_source": "synthetic_model",
+                    "is_real": False,
                 }
-                rows_by_strike[k][otype] = row_dict
-                all_chain_rows.append(row_dict)
-            else:
-                # Ensure IV is formatted as percentage
-                if existing.get("iv", 0.0) < 1.0:
-                    existing["iv"] = round(existing["iv"] * 100.0, 2)
 
     # Build Matrix DataFrame
     matrix_rows = []
@@ -243,10 +401,10 @@ def load_options_chain_data(
 
     df_matrix = pd.DataFrame(matrix_rows)
 
-    # Derived summary metrics
+    # Derived summary metrics from real OI surface
     pcr_oi = round(total_pe_oi / max(total_ce_oi, 1), 3)
 
-    # Max Pain calculation
+    # Max Pain calculation across all strikes
     strikes_arr = np.array(sorted(target_strikes))
     total_losses = []
     for s in strikes_arr:
@@ -272,6 +430,27 @@ def load_options_chain_data(
     # Gamma exposure (GEX) estimate in Cr
     net_gex_crores = round(((total_ce_oi - total_pe_oi) * atm_gamma * (spot_price ** 2) * 0.01) / 1e7, 2)
 
+    # Telemetry and Feed Transparency Metadata
+    total_contracts = len(target_strikes) * 2
+    is_synthetic = (real_strikes_count == 0)
+    if real_strikes_count == total_contracts:
+        feed_type = "Live NFO WebSocket Feed" if has_live_ticks else "Live NFO Exchange Feed (Real Market Snapshots)"
+        feed_badge_color = "#00E676"
+    elif real_strikes_count > 0:
+        feed_type = f"Hybrid Feed ({real_strikes_count}/{total_contracts} Live Strikes)"
+        feed_badge_color = "#FFB300"
+    else:
+        feed_type = "Estimated / Synthetic Model"
+        feed_badge_color = "#FF5252"
+
+    if latest_ts is not None:
+        try:
+            last_opt_tick_str = latest_ts.strftime("%Y-%m-%d %H:%M:%S IST")
+        except Exception:
+            last_opt_tick_str = str(latest_ts)
+    else:
+        last_opt_tick_str = "N/A (Synthetic Baseline)"
+
     return {
         "matrix_df": df_matrix,
         "pcr_oi": pcr_oi,
@@ -291,4 +470,10 @@ def load_options_chain_data(
         "total_ce_oi": total_ce_oi,
         "total_pe_oi": total_pe_oi,
         "expiry_str": expiry_str,
+        "feed_type": feed_type,
+        "feed_badge_color": feed_badge_color,
+        "last_option_tick_time": last_opt_tick_str,
+        "is_synthetic": is_synthetic,
+        "real_strikes_count": real_strikes_count,
+        "total_strikes_count": total_contracts,
     }

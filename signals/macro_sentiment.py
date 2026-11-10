@@ -8,7 +8,9 @@ Fetches and scores:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import time
 import urllib.request
@@ -16,6 +18,9 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger("MacroSentimentEngine")
 
@@ -292,6 +297,51 @@ class MacroSentimentEngine:
                     )
         except Exception as e:
             logger.warning("yfinance macro download failed: %s. Using default baseline quotes.", e)
+
+        # Enhance with Finnhub real-time quotes if configured
+        finnhub_key = os.getenv("FINNHUB_API_KEY", "").strip()
+        if finnhub_key:
+            fh_map = {
+                "^GSPC": ("SPY", "S&P 500 (SPY)", "EQUITY"),
+                "^IXIC": ("QQQ", "Nasdaq Composite (QQQ)", "TECH_EQUITY"),
+                "^DJI": ("DIA", "Dow Jones Industrial (DIA)", "EQUITY"),
+            }
+            for sym, (fh_sym, fh_name, asset_type) in fh_map.items():
+                if sym not in quotes:
+                    try:
+                        url = f"https://finnhub.io/api/v1/quote?symbol={fh_sym}&token={finnhub_key}"
+                        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=3) as resp:
+                            data_fh = json.loads(resp.read().decode())
+                            curr = float(data_fh.get("c", 0.0))
+                            chg_pct = float(data_fh.get("dp", 0.0))
+                            chg = float(data_fh.get("d", 0.0))
+                            if curr > 0:
+                                if chg_pct >= 0.5:
+                                    bias = "BULLISH"
+                                    norm_val = min(chg_pct / 2.0, 1.0)
+                                elif chg_pct <= -0.5:
+                                    bias = "BEARISH"
+                                    norm_val = max(chg_pct / 2.0, -1.0)
+                                else:
+                                    bias = "NEUTRAL"
+                                    norm_val = chg_pct / 1.0
+                                score_components.append(norm_val * (0.30 if asset_type == "TECH_EQUITY" else 0.20))
+                                quotes[sym] = MacroQuote(
+                                    symbol=sym,
+                                    name=fh_name,
+                                    price=round(curr, 2),
+                                    change=round(chg, 2),
+                                    change_pct=round(chg_pct, 2),
+                                    impact_bias=bias,
+                                    quote_time=now_str,
+                                    is_delayed=False,
+                                    data_source="Finnhub (Real-Time)",
+                                )
+                    except Exception as e:
+                        logger.debug("Finnhub quote fetch error for %s: %s", fh_sym, e)
+
+        if not quotes or len(quotes) < 4:
             quotes = self._default_macro_quotes()
             score_components = [0.15]
 
@@ -375,9 +425,45 @@ class MacroSentimentEngine:
                 scores.append(score)
 
         except Exception as e:
-            logger.warning("RSS news fetching failed: %s. Using default news feed.", e)
-            headlines = self._default_headlines()
-            scores = [-0.10]
+            logger.warning("RSS news fetching failed: %s. Checking Finnhub news...", e)
+            finnhub_key = os.getenv("FINNHUB_API_KEY", "").strip()
+            if finnhub_key:
+                try:
+                    url_fh = f"https://finnhub.io/api/v1/news?category=general&token={finnhub_key}"
+                    req_fh = urllib.request.Request(url_fh, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req_fh, timeout=3) as resp_fh:
+                        items_fh = json.loads(resp_fh.read().decode())
+                        for it in items_fh[:10]:
+                            raw_t = str(it.get("headline", "")).strip()
+                            if not raw_t:
+                                continue
+                            source_fh = str(it.get("source", "Finnhub"))
+                            pub_fh = datetime.fromtimestamp(it.get("datetime", int(time.time()))).strftime("%Y-%m-%d %H:%M")
+                            low_t = raw_t.lower()
+                            words = set(re.findall(r"\b[a-z]+\b", low_t))
+                            bull_hits = words.intersection(BULLISH_KEYWORDS)
+                            bear_hits = words.intersection(BEARISH_KEYWORDS)
+                            score = len(bull_hits) * 0.35 - len(bear_hits) * 0.35
+                            score = max(-1.0, min(1.0, score))
+                            sent = "BULLISH" if score >= 0.15 else ("BEARISH" if score <= -0.15 else "NEUTRAL")
+                            headlines.append(
+                                NewsHeadline(
+                                    title=raw_t,
+                                    source=source_fh,
+                                    published=pub_fh,
+                                    sentiment=sent,
+                                    score=round(score, 2),
+                                    keywords=list(bull_hits.union(bear_hits)),
+                                )
+                            )
+                            scores.append(score)
+                except Exception as fh_err:
+                    logger.debug("Finnhub news fallback error: %s", fh_err)
+
+            if not headlines:
+                logger.warning("Using default news feed.")
+                headlines = self._default_headlines()
+                scores = [-0.10]
 
         news_score = round(float(sum(scores) / max(len(scores), 1)), 3)
         news_score = max(-1.0, min(1.0, news_score))

@@ -68,6 +68,7 @@ def calculate_option_paper_costs(
     exit_premium: float,
     quantity: int,
     recorded_bid_ask_spread: Optional[float] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Calculate exact options statutory costs per trade round-trip.
     
@@ -169,6 +170,8 @@ def log_and_evaluate_signal(
     score: float,
     current_ltp: float,
     recorded_bid_ask_spread: Optional[float] = None,
+    is_stale: bool = False,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Log signal to paper_signals_log and update running stats."""
     db_path = get_paper_db_path()
@@ -190,7 +193,8 @@ def log_and_evaluate_signal(
               AND timestamp >= now() - INTERVAL 60 SECOND
         """).fetchone()[0]
         
-        if recent == 0 and action in ["BUY_CE", "BUY_PE"]:
+        # Stale-Data Lock: Stop paper-trade logging when data is stale
+        if not is_stale and recent == 0 and action in ["BUY_CE", "BUY_PE"]:
             con.execute("""
                 INSERT INTO paper_signals_log VALUES (
                     ?, now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN',

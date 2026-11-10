@@ -757,7 +757,7 @@ class IntradaySignalEngine:
                         "position": "aboveBar",
                         "color": "#FF5252",
                         "shape": "arrowDown",
-                        "text": f"SELL {plan.suggested_strike}",
+                        "text": f"BUY {plan.suggested_strike}",
                     })
 
         total = len(trades)
@@ -790,86 +790,92 @@ class IntradaySignalEngine:
         return stats, markers
 
     def generate_intraday_log(
-        self, current_plan: TradePlan, date_str: Optional[str] = None, timeframe: str = "15m", **kwargs
+        self,
+        current_plan: TradePlan,
+        date_str: Optional[str] = None,
+        timeframe: str = "15m",
+        candles_df: Optional[pd.DataFrame] = None,
+        **kwargs,
     ) -> pd.DataFrame:
-        """Generate chronologically sorted intraday signal log for today's intervals."""
+        """Generate chronologically sorted intraday signal log from authentic evaluated bars."""
         d_str = date_str or datetime.now().strftime("%Y-%m-%d")
-        tf = timeframe.lower()
+        df_src = candles_df if candles_df is not None else kwargs.get("df_candles")
+        rows = []
 
-        if "1m" in tf:
-            times = ["09:15", "10:02", "11:45", "13:30", "15:20"]
-        elif "3m" in tf:
-            times = ["09:15", "10:06", "11:42", "13:33", "15:18"]
-        elif "5m" in tf:
-            times = ["09:15", "10:10", "11:40", "13:35", "15:15"]
-        else:
-            times = ["09:15", "09:45", "11:15", "13:30", "15:15"]
+        if df_src is not None and not df_src.empty:
+            df_day = df_src[pd.to_datetime(df_src["timestamp"]).dt.strftime("%Y-%m-%d") == d_str].copy()
+            if not df_day.empty:
+                last_sig_time = None
+                last_sig_dir = 0
+                for idx, bar in df_day.iterrows():
+                    ts = pd.to_datetime(bar["timestamp"])
+                    ts_str = ts.strftime("%H:%M")
+                    c = float(bar["close"])
+                    plan = self.compute_6factor_signal(
+                        spot_price=c,
+                        ema_9=float(bar.get("ema_9", c)),
+                        ema_21=float(bar.get("ema_21", c)),
+                        ema_50=float(bar.get("ema_50", c)),
+                        ema_200=float(bar.get("ema_200", c)),
+                        supertrend=float(bar.get("supertrend", c)),
+                        supertrend_direction=int(bar.get("supertrend_direction", 1)),
+                        vwap=float(bar.get("vwap", c)),
+                        rsi_14=float(bar.get("rsi_14", 50.0)),
+                        macd_hist=float(bar.get("macd_hist", 0.0)),
+                        adx_14=float(bar.get("adx_14", 25.0)),
+                        squeeze_on=bool(bar.get("squeeze_on", False)),
+                        atr_14=float(bar.get("atr_14", 25.0)),
+                        account_equity=current_plan.capital_allocated_inr or 100000.0,
+                    )
 
-        rows = [
-            {
-                "Timestamp": f"{d_str} {times[0]}:00",
-                "Time": times[0],
-                "Signal": "NEUTRAL / WAIT",
-                "Trigger": "Market Open - Initial Price Discovery (Range Formation)",
-                "Spot (₹)": 22645.0,
-                "Strike": "22650 CE/PE",
-                "Confidence": 0.50,
-                "Score": 0.0,
-                "Status": "OBSERVE",
-                "Realized P&L": "₹0.00",
-                "Confluence Drivers": "Initial opening range; PCR=1.02 balanced; VIX=13.8",
-            },
-            {
-                "Timestamp": f"{d_str} {times[1]}:00",
-                "Time": times[1],
-                "Signal": "BUY",
-                "Trigger": "EMA Ribbon Alignment + High Put Writing (PCR 1.18)",
-                "Spot (₹)": 22672.5,
-                "Strike": "22700 CE",
-                "Confidence": 0.78,
-                "Score": 2.1,
-                "Status": "TARGET 1 HIT",
-                "Realized P&L": "+₹14,250.00",
-                "Confluence Drivers": "Spot crossed above EMA9 & EMA21; Supertrend green; ADX=26.4",
-            },
-            {
-                "Timestamp": f"{d_str} {times[2]}:00",
-                "Time": times[2],
-                "Signal": "NEUTRAL / WAIT",
-                "Trigger": "Consolidation below 22,720 resistance; ADX dropped to 21.0",
-                "Spot (₹)": 22695.0,
-                "Strike": "WAIT",
-                "Confidence": 0.50,
-                "Score": 0.2,
-                "Status": "CLOSED",
-                "Realized P&L": "+₹6,800.00",
-                "Confluence Drivers": "Resistance band 22,720 tested; momentum normalized; T1 profit secured",
-            },
-            {
-                "Timestamp": f"{d_str} {times[3]}:00",
-                "Time": times[3],
-                "Signal": "STRONG BUY",
-                "Trigger": "PCR 1.14+; Roll Spread confirmed; Max Pain gravity at 22,700",
-                "Spot (₹)": 22705.0,
-                "Strike": "22700 CE",
-                "Confidence": 0.88,
-                "Score": 3.8,
-                "Status": "ACTIVE",
-                "Realized P&L": "+₹8,125.00 (Unrealized)",
-                "Confluence Drivers": "L2 order flow bid heavy; Supertrend trailing floor; ADX=29.2",
-            },
-            {
-                "Timestamp": f"{d_str} {times[4]}:00",
-                "Time": times[4],
-                "Signal": current_plan.state.value,
-                "Trigger": " | ".join(current_plan.reasons[:2]) if current_plan.reasons else "Active Confluence",
-                "Spot (₹)": current_plan.spot_price,
-                "Strike": current_plan.suggested_strike,
-                "Confidence": current_plan.confidence,
-                "Score": current_plan.score,
-                "Status": "LIVE CANDLE",
-                "Realized P&L": "ACTIVE",
-                "Confluence Drivers": " | ".join(current_plan.reasons),
-            },
-        ]
+                    sig_dir = 1 if "BUY" in plan.state.value else (-1 if "SELL" in plan.state.value else 0)
+                    # Collision & cooldown guard: do not emit duplicate/opposing signals on same or adjacent bars
+                    if sig_dir != 0 and sig_dir != last_sig_dir:
+                        action_label = f"BUY {plan.suggested_strike}" if "BUY" in plan.state.value else f"BUY {plan.suggested_strike}"
+                        dir_label = "BULLISH (BUY CE)" if sig_dir == 1 else "BEARISH (BUY PE)"
+                        rows.append({
+                            "Timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                            "Time": ts_str,
+                            "Direction": dir_label,
+                            "Signal": action_label,
+                            "Trigger": " | ".join(plan.reasons[:2]) if plan.reasons else "Confluence Alignment",
+                            "Spot (₹)": round(c, 2),
+                            "Spot SL (₹)": round(plan.stop_loss, 2),
+                            "Spot Target (₹)": round(plan.target_1, 2),
+                            "Strike": plan.suggested_strike,
+                            "Option Premium Est": round(plan.option_entry_ltp, 1),
+                            "Option SL": round(plan.option_stop_loss, 1),
+                            "Option Target": round(plan.option_target_1, 1),
+                            "Confidence": round(plan.confidence, 2),
+                            "Score": round(plan.score, 2),
+                            "Status": "HISTORICAL SIGNAL",
+                            "Realized P&L": "₹0.00",
+                            "Confluence Drivers": " | ".join(plan.reasons),
+                        })
+                        last_sig_dir = sig_dir
+                        last_sig_time = ts
+
+        # Always include active live candle plan
+        active_dir = "BULLISH (BUY CE)" if "BUY" in current_plan.state.value else ("BEARISH (BUY PE)" if "SELL" in current_plan.state.value else "NEUTRAL / WAIT")
+        active_action = f"BUY {current_plan.suggested_strike}" if current_plan.state != SignalState.NEUTRAL else "WAIT / NO POSITION"
+        rows.append({
+            "Timestamp": current_plan.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "Time": current_plan.timestamp.strftime("%H:%M"),
+            "Direction": active_dir,
+            "Signal": active_action,
+            "Trigger": " | ".join(current_plan.reasons[:2]) if current_plan.reasons else "Active Forming Bar",
+            "Spot (₹)": round(current_plan.spot_price, 2),
+            "Spot SL (₹)": round(current_plan.stop_loss, 2),
+            "Spot Target (₹)": round(current_plan.target_1, 2),
+            "Strike": current_plan.suggested_strike,
+            "Option Premium Est": round(current_plan.option_entry_ltp, 1),
+            "Option SL": round(current_plan.option_stop_loss, 1),
+            "Option Target": round(current_plan.option_target_1, 1),
+            "Confidence": round(current_plan.confidence, 2),
+            "Score": round(current_plan.score, 2),
+            "Status": "LIVE CANDLE",
+            "Realized P&L": "ACTIVE",
+            "Confluence Drivers": " | ".join(current_plan.reasons),
+        })
+
         return pd.DataFrame(rows)

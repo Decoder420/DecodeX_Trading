@@ -45,6 +45,7 @@ try:
 except Exception:
     pass
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 logger = logging.getLogger("LiveRecorder")
 
 
@@ -122,6 +123,8 @@ class LiveRecorderEngine:
 
         # Rolling 1-minute futures bar aggregator: {symbol: {open, high, low, close, volume, oi}}
         self.rolling_bars: Dict[str, Dict[str, Any]] = {}
+        self.option_tokens_meta: Dict[str, Dict[str, Any]] = {}
+        self.latest_option_quotes: Dict[str, Dict[str, Any]] = {}
         self._tick_buffer: List[Dict[str, Any]] = []
         self._depth_buffer: List[Dict[str, Any]] = []
         self._last_flush_time = time.time()
@@ -159,6 +162,19 @@ class LiveRecorderEngine:
                 "total_ticks": self.ticks_count,
                 "source": self.active_source,
                 "disconnect_count": self.disconnect_count,
+                "active_option_tokens": len(self.option_tokens_meta),
+                "latest_option_quotes_count": len(self.latest_option_quotes),
+                "latest_option_quotes": self.latest_option_quotes,
+                "last_option_tick_time": max(
+                    [
+                        q.get("exchange_timestamp").strftime("%Y-%m-%d %H:%M:%S")
+                        if hasattr(q.get("exchange_timestamp"), "strftime")
+                        else str(q.get("exchange_timestamp"))
+                        for q in self.latest_option_quotes.values()
+                        if q.get("exchange_timestamp")
+                    ],
+                    default=None,
+                ),
             }
             tmp_path = self.storage.base_dir / "live_state.tmp"
             final_path = self.storage.base_dir / "live_state.json"
@@ -209,12 +225,90 @@ class LiveRecorderEngine:
         self.options_monitor = OptionsMonitor(self.client, self.cfg)
         logger.info("Angel One connected successfully. WebSocket and OptionsMonitor initialized.")
 
+    def _resolve_active_option_tokens(
+        self,
+        underlying: str = "NIFTY",
+        window_strikes: int = 7,
+    ) -> List[Dict[str, Any]]:
+        """Resolve ATM ± window_strikes option tokens (15 strikes CE & PE = 30 tokens) for active contract."""
+        scrips = []
+        if self.options_monitor and self.options_monitor._scrip_master:
+            scrips = self.options_monitor._scrip_master
+        else:
+            cache_p = PROJECT_ROOT / "data" / "cache" / "angel_scrip_master.json"
+            if cache_p.exists():
+                try:
+                    with open(cache_p, "r", encoding="utf-8") as f:
+                        scrips = json.load(f)
+                except Exception as e:
+                    logger.warning("Failed loading scrip master for option tokens: %s", e)
+
+        if not scrips:
+            return []
+
+        today = datetime.now().date()
+        expiries_found = set()
+        for s in scrips:
+            if s.get("name") == underlying and s.get("instrumenttype") == "OPTIDX":
+                exp = s.get("expiry")
+                if exp:
+                    try:
+                        exp_dt = datetime.strptime(exp, "%d%b%Y").date()
+                        if exp_dt >= today:
+                            expiries_found.add((exp_dt, exp))
+                    except Exception:
+                        pass
+
+        if not expiries_found:
+            return []
+
+        sorted_exps = sorted(list(expiries_found), key=lambda x: x[0])
+        active_expiry = sorted_exps[0][1]
+
+        spot = self.latest_prices.get(underlying, 22700.0)
+        step = 50.0 if underlying == "NIFTY" else 100.0
+        center = round(spot / step) * step
+        target_strikes = set(round(center + i * step, 2) for i in range(-window_strikes, window_strikes + 1))
+
+        seg = "NFO" if underlying in ["NIFTY", "BANKNIFTY"] else "BFO"
+        resolved = []
+        for s in scrips:
+            if (
+                s.get("exch_seg") == seg
+                and s.get("name") == underlying
+                and s.get("expiry") == active_expiry
+                and s.get("instrumenttype") == "OPTIDX"
+            ):
+                strike = round(float(s.get("strike", 0)) / 100.0, 2)
+                if strike in target_strikes:
+                    tok = str(s.get("token"))
+                    sym = str(s.get("symbol"))
+                    otype = "CE" if "CE" in sym.upper() else "PE"
+                    meta = {
+                        "token": tok,
+                        "symbol": sym,
+                        "underlying": underlying,
+                        "strike": strike,
+                        "option_type": otype,
+                        "instrument_type": "OPTIDX",
+                        "expiry": active_expiry,
+                        "exch_seg": seg,
+                    }
+                    self.option_tokens_meta[tok] = meta
+                    resolved.append(meta)
+        return resolved
+
     def _on_ws_open(self, wsapp: Any) -> None:
-        logger.info("WebSocket connected. Subscribing to 9 core tokens (Mode 3 SNAP_QUOTE)...")
+        opt_scrips = self._resolve_active_option_tokens("NIFTY", window_strikes=7)
+        opt_tokens = [s["token"] for s in opt_scrips]
+        logger.info(
+            "WebSocket connected. Subscribing to 9 core tokens + %d NFO option tokens (ATM ± 7 for active contract)...",
+            len(opt_tokens),
+        )
         token_list = [
             {"exchangeType": 1, "tokens": ["99926000", "99926009"]},
             {"exchangeType": 3, "tokens": ["99919000"]},
-            {"exchangeType": 2, "tokens": ["48704", "61471", "48699", "61466"]},
+            {"exchangeType": 2, "tokens": ["48704", "61471", "48699", "61466"] + opt_tokens},
             {"exchangeType": 4, "tokens": ["864571", "1100929"]},
         ]
         self.ws.subscribe("sub_core", 3, token_list)
@@ -232,6 +326,8 @@ class LiveRecorderEngine:
 
     def _token_to_symbol(self, token: str) -> Tuple[str, str]:
         t = str(token)
+        if t in self.option_tokens_meta:
+            return self.option_tokens_meta[t]["symbol"], "OPTIDX"
         if t == "99926000":
             return "NIFTY", "AMXIDX"
         if t == "99926009":
@@ -277,6 +373,17 @@ class LiveRecorderEngine:
                 self.active_source = "websocket"
                 self.latest_prices[symbol] = ltp
 
+                # Update live option quote cache if OPTIDX
+                if inst_type == "OPTIDX":
+                    self.latest_option_quotes[token] = {
+                        "token": token,
+                        "symbol": symbol,
+                        "ltp": ltp,
+                        "oi": oi,
+                        "volume": vol,
+                        "exchange_timestamp": exch_ts,
+                    }
+
                 # Update rolling bar for futures
                 if "FUT" in symbol:
                     if symbol not in self.rolling_bars:
@@ -321,6 +428,11 @@ class LiveRecorderEngine:
                 tot_s = float(data.get("total_sell_quantity", 0))
                 imbalance = (tot_b - tot_s) / (tot_b + tot_s) if (tot_b + tot_s) > 0 else 0.0
                 spread = max(0.0, b_ask - b_bid)
+
+                if inst_type == "OPTIDX" and token in self.latest_option_quotes:
+                    self.latest_option_quotes[token]["best_bid"] = b_bid
+                    self.latest_option_quotes[token]["best_ask"] = b_ask
+                    self.latest_option_quotes[token]["spread"] = spread
 
                 depth_row = {
                     "timestamp": now_dt,
@@ -519,12 +631,141 @@ class LiveRecorderEngine:
                         metrics["roll_spread"] = roll_rec.roll_spread
                 self.storage.insert_derived_metrics([metrics])
 
+    def _reconcile_bars_cycle(self) -> None:
+        """1-minute bar reconciler: fetch just-completed 1m bars for indices and nearest futures.
+        
+        Runs once a minute using shared rate limiter (~4 calls per minute) and stores as official bars.
+        """
+        now_ist = datetime.now(self.tz)
+        if not self.cfg.is_trading_day(now_ist.date()):
+            return
+        if now_ist.time() < datetime.strptime("09:16:00", "%H:%M:%S").time():
+            return
+
+        end_m = now_ist.replace(second=0, microsecond=0)
+        start_m = end_m - timedelta(minutes=2)
+
+        start_str = start_m.strftime("%Y-%m-%d %H:%M")
+        end_str = end_m.strftime("%Y-%m-%d %H:%M")
+
+        targets = [
+            ("NIFTY", "NSE", "99926000", True),
+            ("BANKNIFTY", "NSE", "99926009", True),
+            ("SENSEX", "BSE", "99919000", True),
+            ("NIFTY_FUT_NEAR", "NFO", "61471", False),
+        ]
+
+        for sym, exch, tok, is_index in targets:
+            try:
+                params = {
+                    "exchange": exch,
+                    "symboltoken": tok,
+                    "interval": "ONE_MINUTE",
+                    "fromdate": start_str,
+                    "todate": end_str,
+                }
+                res = shared_rate_limiter.execute_with_backoff(
+                    "getCandleData",
+                    self.client.getCandleData,
+                    params,
+                )
+                raw_bars = res.get("data") or []
+                if raw_bars:
+                    b = raw_bars[-1]
+                    ts_str, op, hi, lo, cl, vol = b
+                    if is_index:
+                        self.storage.insert_index_1m_bars([{
+                            "timestamp": pd.to_datetime(ts_str),
+                            "symbol": sym,
+                            "open": float(op),
+                            "high": float(hi),
+                            "low": float(lo),
+                            "close": float(cl),
+                            "volume": 0.0,
+                            "source": "official_reconciled",
+                        }])
+                    else:
+                        self.storage.insert_futures_bars([{
+                            "timestamp": pd.to_datetime(ts_str),
+                            "symbol": sym,
+                            "token": tok,
+                            "contract_expiry": self.FUTURES_EXPIRIES.get(sym, date(2026, 11, 23)),
+                            "open": float(op),
+                            "high": float(hi),
+                            "low": float(lo),
+                            "close": float(cl),
+                            "volume": int(vol),
+                            "oi": 0,
+                            "vwap": float(cl),
+                            "source": "official_reconciled",
+                        }])
+                    logger.debug("Reconciled official 1m bar for [%s]: %s C=%.2f", sym, ts_str, float(cl))
+            except Exception as e:
+                logger.warning("Reconciler cycle error for [%s]: %s", sym, e)
+
+    def _startup_reconnect_gap_fill(self) -> None:
+        """Startup/reconnect gap-fill from historical API for any missing 1m bars."""
+        now_ist = datetime.now(self.tz)
+        if not self.cfg.is_trading_day(now_ist.date()):
+            return
+
+        m_start = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+        m_end = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        if now_ist <= m_start:
+            return
+
+        target_end = min(now_ist, m_end)
+        latest_ts = self.storage.get_latest_index_timestamp("NIFTY")
+        fetch_from = m_start if latest_ts is None else (latest_ts + timedelta(minutes=1))
+
+        if (target_end - fetch_from).total_seconds() < 60:
+            return
+
+        logger.info(
+            "Startup/Reconnect gap-fill: fetching missing interval %s to %s from historical API...",
+            fetch_from.strftime("%H:%M"),
+            target_end.strftime("%H:%M"),
+        )
+        for sym, exch, tok in [("NIFTY", "NSE", "99926000"), ("BANKNIFTY", "NSE", "99926009"), ("SENSEX", "BSE", "99919000")]:
+            try:
+                params = {
+                    "exchange": exch,
+                    "symboltoken": tok,
+                    "interval": "ONE_MINUTE",
+                    "fromdate": fetch_from.strftime("%Y-%m-%d %H:%M"),
+                    "todate": target_end.strftime("%Y-%m-%d %H:%M"),
+                }
+                res = shared_rate_limiter.execute_with_backoff(
+                    "getCandleData",
+                    self.client.getCandleData,
+                    params,
+                )
+                bars = res.get("data") or []
+                rows = []
+                for b in bars:
+                    ts_str, op, hi, lo, cl, _ = b
+                    rows.append({
+                        "timestamp": pd.to_datetime(ts_str),
+                        "symbol": sym,
+                        "open": float(op),
+                        "high": float(hi),
+                        "low": float(lo),
+                        "close": float(cl),
+                        "volume": 0.0,
+                        "source": "broker_history",
+                    })
+                if rows:
+                    self.storage.insert_index_1m_bars(rows)
+                    logger.info("Startup gap-filled %d official 1m bars for [%s].", len(rows), sym)
+            except Exception as e:
+                logger.warning("Startup gap-fill error for [%s]: %s", sym, e)
+
     def _record_health(self) -> None:
-        """Insert health heartbeat into recorder_health table."""
+        """Insert health heartbeat into recorder_health table with stale alert checking."""
         now_dt = datetime.now()
+        now_ist = datetime.now(self.tz)
         uptime = time.time() - (self.start_time or time.time())
         rate = round(self.ticks_count / max(uptime, 1.0), 2)
-        # RSS memory in MB
         try:
             mem = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024), 2)
         except Exception:
@@ -532,9 +773,27 @@ class LiveRecorderEngine:
 
         tick_age = round(time.time() - self.last_tick_time, 1) if self.last_tick_time > 0 else 999.0
 
+        # Heartbeat alert check
+        is_market_session = (
+            self.cfg.is_trading_day(now_ist.date())
+            and datetime.strptime("09:15:00", "%H:%M:%S").time() <= now_ist.time() <= datetime.strptime("15:30:00", "%H:%M:%S").time()
+        )
+
+        status = "RUNNING" if self.running else "STOPPED"
+        if is_market_session:
+            if tick_age > 15.0:
+                status = "ALERT_STALE"
+                logger.critical(
+                    "HEARTBEAT ALERT: Market data STALE! Last tick age is %.1fs (> 15.0s threshold) during active trading hours!",
+                    tick_age,
+                )
+            elif not self.running:
+                status = "ALERT_STOPPED"
+                logger.critical("HEARTBEAT ALERT: Market recorder is STOPPED during active trading hours!")
+
         health_row = {
             "timestamp": now_dt,
-            "status": "RUNNING" if self.running else "STOPPED",
+            "status": status,
             "uptime_seconds": round(uptime, 1),
             "ticks_received": self.ticks_count,
             "tick_rate_per_sec": rate,
@@ -562,6 +821,9 @@ class LiveRecorderEngine:
         self.start_time = time.time()
         self.last_tick_time = time.time()
 
+        # Startup gap-fill for any missing 1m bars before launch
+        self._startup_reconnect_gap_fill()
+
         # Start WebSocket in daemon thread
         ws_thread = threading.Thread(target=self.ws.connect, daemon=True)
         ws_thread.start()
@@ -581,12 +843,12 @@ class LiveRecorderEngine:
                 if (now - self.last_tick_time) >= 10.0:
                     self._poll_rest_fallback()
 
-                # 1-Minute Cycle (Options snapshot & Futures bar flush)
-                # In test mode with duration <= 120s, run every 20s for immediate demonstration
+                # 1-Minute Cycle (Options snapshot, Futures bar flush, and 1m Reconciler)
                 cycle_interval = 20.0 if (duration_seconds and duration_seconds <= 120) else 60.0
                 if (now - last_min_cycle) >= cycle_interval:
                     self._flush_futures_bars()
                     self._options_snapshot_cycle()
+                    self._reconcile_bars_cycle()
                     last_min_cycle = now
 
                 # Health Heartbeat (every 10s in test mode, 60s in production)

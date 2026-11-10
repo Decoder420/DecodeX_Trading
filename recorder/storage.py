@@ -133,7 +133,47 @@ class LiveStorageManager:
                 last_tick_age_seconds DOUBLE,
                 memory_mb DOUBLE
             );
+
+            CREATE TABLE IF NOT EXISTS index_1m_bars (
+                timestamp TIMESTAMPTZ,
+                symbol VARCHAR,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                volume DOUBLE,
+                source VARCHAR
+            );
         """)
+
+    def insert_index_1m_bars(self, rows: List[Dict[str, Any]], target_date: Optional[date] = None) -> int:
+        if not rows:
+            return 0
+        df = pd.DataFrame(rows)
+        with self._lock:
+            conn = self.get_connection(target_date)
+            try:
+                conn.register("df_ibars", df)
+                conn.execute("INSERT INTO index_1m_bars SELECT * FROM df_ibars")
+                return len(rows)
+            finally:
+                conn.close()
+
+    def get_latest_index_timestamp(self, symbol: str, target_date: Optional[date] = None) -> Optional[datetime]:
+        with self._lock:
+            conn = self.get_connection(target_date)
+            try:
+                tables = [t[0] for t in conn.execute("SHOW TABLES").fetchall()]
+                if "index_1m_bars" not in tables:
+                    return None
+                res = conn.execute(
+                    "SELECT MAX(timestamp) FROM index_1m_bars WHERE symbol = ?", [symbol]
+                ).fetchone()
+                if res and res[0] is not None:
+                    return pd.to_datetime(res[0]).to_pydatetime()
+                return None
+            finally:
+                conn.close()
 
     def insert_ticks(self, rows: List[Dict[str, Any]], target_date: Optional[date] = None) -> int:
         if not rows:

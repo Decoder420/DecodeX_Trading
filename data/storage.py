@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -14,6 +17,29 @@ import pytz
 from config.loader import ConfigManager, config_manager
 
 logger = logging.getLogger(__name__)
+
+_DOWNLOADER_WRITE_AUTHORIZED = threading.local()
+
+
+@contextmanager
+def DownloaderWriteGuard():
+    """Context manager authorizing writes to market_data.duckdb strictly from downloader workflows."""
+    _DOWNLOADER_WRITE_AUTHORIZED.active = True
+    try:
+        yield
+    finally:
+        _DOWNLOADER_WRITE_AUTHORIZED.active = False
+
+
+def is_downloader_authorized() -> bool:
+    """Check whether current thread or call stack is authorized to write to market_data.duckdb."""
+    if getattr(_DOWNLOADER_WRITE_AUTHORIZED, "active", False):
+        return True
+    for frame_info in inspect.stack():
+        filename = frame_info.filename.lower()
+        if "historical_downloader" in filename:
+            return True
+    return False
 
 
 class StorageManager:
@@ -159,8 +185,21 @@ class StorageManager:
         if df.empty:
             return 0
 
+        # Guard: Only the historical downloader may write to market_data.duckdb
+        if self.db_path.name == "market_data.duckdb" and not is_downloader_authorized():
+            raise PermissionError(
+                f"UNAUTHORIZED WRITER GUARD: Only data.historical_downloader is permitted to write to {self.db_path.name}. "
+                "All other components, tests, and real-time feeds are forbidden from writing to the persistent historical archive."
+            )
+
         table_name = self._format_table_name(symbol, timeframe)
         clean_df = df.copy()
+
+        # Enforce Index volume is 0. Spot indices and VIX do not trade volume.
+        clean_symbol = symbol.replace("^", "").replace(" ", "_").replace(":", "_").lower()
+        index_names = {"nifty", "banknifty", "sensex", "india_vix", "vix"}
+        if clean_symbol in index_names or any(idx in clean_symbol for idx in index_names):
+            clean_df["volume"] = 0.0
 
         # Ensure timestamp is string in ISO format for stable database storage
         if "timestamp" not in clean_df.columns:

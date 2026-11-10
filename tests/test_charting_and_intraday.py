@@ -131,12 +131,14 @@ def test_intraday_atr_and_tight_chart_viewport():
     candle_low_min = float(candles["low"].min())
     candle_high_max = float(candles["high"].max())
 
-    expected_min = min(candle_low_min, plan.target_2) - 30.0
-    expected_max = max(candle_high_max, plan.stop_loss) + 30.0
+    # Dynamic 6.5% buffer on top and bottom (5-8% requirement)
+    expected_pad = round((max(candle_high_max, plan.stop_loss) - min(candle_low_min, plan.target_2)) * 0.065, 1)
+    expected_min = min(candle_low_min, plan.target_2) - expected_pad
+    expected_max = max(candle_high_max, plan.stop_loss) + expected_pad
     assert abs(y_min - expected_min) < 0.5
     assert abs(y_max - expected_max) < 0.5
-    # Ensure total Y-span is tightly framed (~370 pts), NOT the bloated 1600 pts
-    assert (y_max - y_min) < 450.0
+    # Ensure total Y-span is tightly framed (~513 pts around authentic session), NOT the bloated 1600 pts
+    assert (y_max - y_min) < 550.0
 
 
 def test_tradingview_html_serialization():
@@ -222,9 +224,13 @@ def test_multi_timeframe_pipeline_and_atr_scaling():
         assert len(candles) >= int(cfg["approx_bars"] * 0.8)
 
         # Verify indicators computed
-        for col in ["open", "high", "low", "close", "ema_9", "ema_21", "ema_50", "ema_200", "supertrend", "vwap", "rsi_14", "macd_hist", "adx_14", "atr_14"]:
+        for col in ["open", "high", "low", "close", "ema_9", "ema_21", "ema_50", "ema_200", "supertrend", "rsi_14", "macd_hist", "adx_14", "atr_14"]:
             assert col in candles.columns
             assert not candles[col].dropna().empty
+
+        # Rule 7: Index volume is 0.0 and index Session VWAP is NaN (hidden)
+        assert (candles["volume"] == 0.0).all()
+        assert candles["vwap"].isna().all()
 
         current_atr = float(candles["atr_14"].dropna().iloc[-1])
         assert current_atr > 0.0
@@ -264,11 +270,14 @@ def test_tradingview_2pane_and_toolbar_toggles():
     assert "btn-5d" in html
     assert "btn-all" in html
     assert "btn-realtime" in html
+    assert "btn-toggle-vol" in html
     assert "btn-toggle-ema" in html
     assert "btn-toggle-st" in html
     assert "btn-toggle-vwap" in html
     assert "btn-toggle-rr" in html
     assert "btn-toggle-sig" in html
+    assert "volumeSeries" in html
+    assert "watermark" in html
 
     # 2-pane layout
     assert "main-pane-wrapper" in html
@@ -329,8 +338,15 @@ def test_chart_refresh_does_not_reapply_tight_y_bounds():
     assert fig_initial.layout.uirevision == "NIFTY_15m_03NOV2026_chart_state"
     assert fig_initial.layout.yaxis.range is not None
     assert len(fig_initial.layout.yaxis.range) == 2
+    assert fig_initial.layout.xaxis.range is not None
+    assert len(fig_initial.layout.xaxis.range) == 2
+    assert "09:15:00" in fig_initial.layout.xaxis.range[0]
+    assert "15:30:00" in fig_initial.layout.xaxis.range[1]
+    assert fig_initial.layout.legend.orientation == "h"
+    assert fig_initial.layout.legend.y == 1.04
+    assert fig_initial.layout.margin.t == 50
 
-    # Fragment Refresh: is_refresh = True -> Do NOT reapply tight bounds (preserve user zoom/pan)
+    # Fragment Refresh: is_refresh = True -> Preserves uirevision and maintains tight 1D viewport without 23,200 blowup
     fig_refresh = build_15m_candlestick_figure(
         df_candles=candles,
         trade_plan=plan,
@@ -341,8 +357,13 @@ def test_chart_refresh_does_not_reapply_tight_y_bounds():
         is_refresh=True,
     )
     assert fig_refresh.layout.uirevision == "NIFTY_15m_03NOV2026_chart_state"
-    assert fig_refresh.layout.yaxis.range is None
-    assert fig_refresh.layout.yaxis.autorange is True
+    assert fig_refresh.layout.yaxis.range is not None
+    assert fig_refresh.layout.yaxis.autorange is False
+    assert len(fig_refresh.layout.yaxis.range) == 2
+    assert fig_refresh.layout.updatemenus is not None
+    assert len(fig_refresh.layout.updatemenus[0].buttons) == 4
+    button_labels = [b.label for b in fig_refresh.layout.updatemenus[0].buttons]
+    assert button_labels == ["1D", "3D", "5D", "ALL"]
 
 
 def test_calculate_tight_y_axis_bounds_helper():

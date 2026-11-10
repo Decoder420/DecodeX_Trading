@@ -31,20 +31,44 @@ def calculate_tight_y_axis_bounds(
     df_candles: pd.DataFrame,
     trade_plan: Optional[TradePlan] = None,
     show_rr: bool = True,
-    padding_pts: float = 30.0,
+    padding_pts: Optional[float] = None,
+    active_session_only: bool = True,
+    buffer_pct: float = 0.065,  # 6.5% buffer on top and bottom (5-8% requirement)
 ) -> tuple[float, float]:
-    """Calculate tight Y-axis viewport bounds based on active price action and risk/reward levels."""
+    """Calculate tight Y-axis viewport bounds based on active session price action and risk/reward levels.
+    
+    Applies a dynamic 5-8% (default 6.5%) vertical buffer to highest high and lowest low to eliminate
+    excessive headroom while ensuring candlestick wicks and reference levels are cleanly visible.
+    """
     if df_candles is None or df_candles.empty:
         base = getattr(trade_plan, "spot_price", 22500.0) if trade_plan else 22500.0
         return (base - 100.0, base + 100.0)
-    
-    c_low = float(df_candles["low"].min())
-    c_high = float(df_candles["high"].max())
+
+    # Isolate active session candles if multi-day dataset is supplied
+    df_target = df_candles
+    if active_session_only and "timestamp" in df_candles.columns and not df_candles.empty:
+        ts_s = pd.to_datetime(df_candles["timestamp"])
+        latest_date = ts_s.dt.date.iloc[-1]
+        session_mask = (ts_s.dt.date == latest_date)
+        if session_mask.any():
+            df_target = df_candles[session_mask]
+
+    c_low = float(df_target["low"].min())
+    c_high = float(df_target["high"].max())
     y_pts = [c_low, c_high]
+
     if show_rr and trade_plan and trade_plan.state != SignalState.NEUTRAL:
         y_pts.extend([trade_plan.stop_loss, trade_plan.target_1, trade_plan.target_2])
-    y_min = min(y_pts) - padding_pts
-    y_max = max(y_pts) + padding_pts
+
+    span = max(y_pts) - min(y_pts)
+    if padding_pts is not None:
+        pad = float(padding_pts)
+    else:
+        # Dynamic 5-8% buffer on top and bottom
+        pad = max(round(span * buffer_pct, 1), 18.0)
+
+    y_min = min(y_pts) - pad
+    y_max = max(y_pts) + pad
     return (round(y_min, 1), round(y_max, 1))
 
 
@@ -60,6 +84,7 @@ def build_15m_candlestick_figure(
     timeframe: str = "15m",
     expiry: Optional[str] = None,
     is_refresh: bool = False,
+    **kwargs: Any,
 ) -> go.Figure:
     """Construct an institutional-grade dark-themed candlestick chart with full persistent overlays."""
     fig = go.Figure()
@@ -82,15 +107,16 @@ def build_15m_candlestick_figure(
     latency_ms = cfg.get("latency_ms", 12.0)
     source = cfg.get("source", "Angel One Live Feed")
 
-    # Header Telemetry Annotation (Tick Time & Latency)
-    fig.add_annotation(
-        xref="paper", yref="paper",
-        x=0.01, y=1.06,
-        text=f"⏱️ <b>Last Tick:</b> {tick_time} | <b>Latency:</b> {latency_ms:.0f} ms | <b>Feed:</b> {source}",
-        showarrow=False,
-        font=dict(color="#00E5FF", size=11, family="monospace"),
-        align="left",
-    )
+    # Header Telemetry Annotation (optional in-canvas overlay; primary display in Streamlit caption)
+    if cfg.get("show_canvas_telemetry", False):
+        fig.add_annotation(
+            xref="paper", yref="paper",
+            x=0.01, y=1.12,
+            text=f"⏱️ <b>Last Tick:</b> {tick_time} | <b>Latency:</b> {latency_ms:.0f} ms | <b>Feed:</b> {source}",
+            showarrow=False,
+            font=dict(color="#00E5FF", size=11, family="monospace"),
+            align="left",
+        )
 
     # 1. Base Candlestick Trace
     fig.add_trace(
@@ -110,7 +136,7 @@ def build_15m_candlestick_figure(
         )
     )
 
-    # 2. EMA 21 Overlay (Cyan dashed)
+    # 2. EMA 21 Overlay (High-Contrast Solid Cyan #00E5FF, width 2.5)
     if show_ema21 and "ema_21" in df_candles.columns:
         fig.add_trace(
             go.Scatter(
@@ -118,12 +144,12 @@ def build_15m_candlestick_figure(
                 y=df_candles["ema_21"],
                 mode="lines",
                 name="EMA 21",
-                line=dict(color="#00E5FF", width=1.5, dash="dash"),
+                line=dict(color="#00E5FF", width=2.5),
                 hoverinfo="skip",
             )
         )
 
-    # 3. EMA 50 Overlay (Orange solid)
+    # 3. EMA 50 Overlay (High-Contrast Solid Amber Orange #FF9100, width 2.2)
     if show_ema50 and "ema_50" in df_candles.columns:
         fig.add_trace(
             go.Scatter(
@@ -131,30 +157,41 @@ def build_15m_candlestick_figure(
                 y=df_candles["ema_50"],
                 mode="lines",
                 name="EMA 50",
-                line=dict(color="#FF9100", width=2.0),
+                line=dict(color="#FF9100", width=2.2),
                 hoverinfo="skip",
             )
         )
 
-    # 4. True Max Pain Strike Reference Line (Purple dotted)
+    # 4. True Max Pain Strike Reference Line (Vivid Magenta Dotted with Top-Left Badge, yshift=10)
     if show_pain:
         pain_val = max_pain_strike or round(trade_plan.spot_price / 50.0) * 50.0
         fig.add_hline(
             y=pain_val,
-            line=dict(color="#B388FF", width=1.5, dash="dot"),
-            annotation_text=f"True Max Pain: ₹{pain_val:,.0f}",
+            line=dict(color="#D500F9", width=2.0, dash="dot"),
+            annotation_text=f"📌 True Max Pain: ₹{pain_val:,.0f}",
             annotation_position="top left",
-            annotation_font=dict(color="#B388FF", size=11),
+            annotation_font=dict(color="#F3E5F5", size=10, family="monospace", weight="bold"),
+            annotation_bgcolor="rgba(74, 20, 140, 0.85)",
+            annotation_bordercolor="#D500F9",
+            annotation_borderwidth=1,
+            annotation_yshift=10,
+            annotation_xshift=10,
         )
 
-    # 5. Live Spot LTP Line (Pulsing Green/Red)
+    # 5. Live Spot LTP Line (Dashed Green/Red with Bottom-Right Price Badge, yshift=-8)
+    # Pinned to bottom-right opposite from Max Pain (top-left) to strictly prevent annotation collision
     ltp_color = "#00E676" if ltp_change >= 0 else "#FF5252"
     fig.add_hline(
         y=trade_plan.spot_price,
-        line=dict(color=ltp_color, width=1.2, dash="dash"),
-        annotation_text=f"LTP: ₹{trade_plan.spot_price:,.2f}",
+        line=dict(color=ltp_color, width=1.8, dash="dash"),
+        annotation_text=f"⚡ LTP: ₹{trade_plan.spot_price:,.2f}",
         annotation_position="bottom right",
-        annotation_font=dict(color=ltp_color, size=12),
+        annotation_font=dict(color="#FFFFFF", size=11, family="monospace", weight="bold"),
+        annotation_bgcolor="rgba(0, 200, 83, 0.90)" if ltp_change >= 0 else "rgba(213, 0, 0, 0.90)",
+        annotation_bordercolor=ltp_color,
+        annotation_borderwidth=1,
+        annotation_yshift=-8,
+        annotation_xshift=-10,
     )
 
     # 6. Intraday Buy/Sell Signal Markers from Signal Log
@@ -163,13 +200,18 @@ def build_15m_candlestick_figure(
         sell_x, sell_y, sell_text, sell_hover = [], [], [], []
         neutral_x, neutral_y, neutral_hover = [], [], []
 
-        candle_times = pd.to_datetime(df_candles["timestamp"]).tolist()
+        candle_times = [
+            t.tz_localize(None) if hasattr(t, "tz_localize") and t.tzinfo else t
+            for t in pd.to_datetime(df_candles["timestamp"]).tolist()
+        ]
 
         for _, row in signal_log_df.iterrows():
             ts_str = str(row.get("Timestamp", ""))
             if not ts_str:
                 continue
             sig_ts = pd.to_datetime(ts_str)
+            if hasattr(sig_ts, "tz_localize") and sig_ts.tzinfo:
+                sig_ts = sig_ts.tz_localize(None)
 
             # Match to closest candle
             closest_idx = min(range(len(candle_times)), key=lambda i: abs(candle_times[i] - sig_ts))
@@ -195,15 +237,17 @@ def build_15m_candlestick_figure(
                 f"<i>Confluence:</i> {confluence}"
             )
 
-            if "BUY" in sig_state:
+            if "BUY" in sig_state or "CE" in sig_state:
                 buy_x.append(c_ts)
                 buy_y.append(c_low - (0.15 * atr_val))
-                buy_text.append(f"BUY | {strike}")
+                clean_strike = strike.replace(" CE", "").replace(" PE", "").strip()
+                buy_text.append(f"BUY {clean_strike} CE" if clean_strike else "BUY CE")
                 buy_hover.append(hover_html)
-            elif "SELL" in sig_state:
+            elif "SELL" in sig_state or "PE" in sig_state:
                 sell_x.append(c_ts)
                 sell_y.append(c_high + (0.15 * atr_val))
-                sell_text.append(f"SELL | {strike}")
+                clean_strike = strike.replace(" CE", "").replace(" PE", "").strip()
+                sell_text.append(f"BUY {clean_strike} PE" if clean_strike else "BUY PE")
                 sell_hover.append(hover_html)
             else:
                 neutral_x.append(c_ts)
@@ -215,12 +259,9 @@ def build_15m_candlestick_figure(
                 go.Scatter(
                     x=buy_x,
                     y=buy_y,
-                    mode="markers+text",
+                    mode="markers",
                     name="BUY Signals",
-                    marker=dict(symbol="triangle-up", size=14, color="#00E676", line=dict(width=1, color="#FFFFFF")),
-                    text=buy_text,
-                    textposition="bottom center",
-                    textfont=dict(color="#00E676", size=10, family="monospace"),
+                    marker=dict(symbol="triangle-up", size=13, color="#00E676", line=dict(width=1, color="#FFFFFF")),
                     hovertext=buy_hover,
                     hoverinfo="text",
                 )
@@ -231,12 +272,9 @@ def build_15m_candlestick_figure(
                 go.Scatter(
                     x=sell_x,
                     y=sell_y,
-                    mode="markers+text",
+                    mode="markers",
                     name="SELL Signals",
-                    marker=dict(symbol="triangle-down", size=14, color="#FF1744", line=dict(width=1, color="#FFFFFF")),
-                    text=sell_text,
-                    textposition="top center",
-                    textfont=dict(color="#FF1744", size=10, family="monospace"),
+                    marker=dict(symbol="triangle-down", size=13, color="#FF1744", line=dict(width=1, color="#FFFFFF")),
                     hovertext=sell_hover,
                     hoverinfo="text",
                 )
@@ -438,10 +476,53 @@ def build_15m_candlestick_figure(
                 borderwidth=1,
             )
 
-    # 8. Y-axis Framing (Tight framing around active price action & SL/TP bounds)
-    y_min, y_max = calculate_tight_y_axis_bounds(df_candles, trade_plan, show_rr=show_rr)
+    # 8. Dynamic Range Bounds & Y-axis Auto-Scaling (1D, 3D, 5D, and ALL)
+    # Ensure y-axis auto-scales dynamically to the highest high and lowest low of the currently selected
+    # visible window (with a fixed 5–8% buffer on top and bottom).
+    has_ts = not df_candles.empty and "timestamp" in df_candles.columns
+    if has_ts:
+        ts_s = pd.to_datetime(df_candles["timestamp"])
+        unique_dates = sorted(ts_s.dt.date.unique())
+        latest_date = unique_dates[-1]
+        today_str = latest_date.strftime("%Y-%m-%d")
+
+        # 1D Bounds (Active Session with 5-8% dynamic buffer)
+        df_1d = df_candles[ts_s.dt.date == latest_date]
+        y_min_1d, y_max_1d = calculate_tight_y_axis_bounds(
+            df_1d, trade_plan, show_rr=show_rr, buffer_pct=0.065
+        )
+        x_1d_range = [f"{today_str} 09:15:00", f"{today_str} 15:30:00"]
+
+        # 3D Bounds
+        d3_dates = unique_dates[-3:] if len(unique_dates) >= 3 else unique_dates
+        df_3d = df_candles[ts_s.dt.date.isin(d3_dates)]
+        y_min_3d, y_max_3d = calculate_tight_y_axis_bounds(
+            df_3d, trade_plan, show_rr=False, buffer_pct=0.065, active_session_only=False
+        )
+        x_3d_start = d3_dates[0].strftime("%Y-%m-%d")
+        x_3d_range = [f"{x_3d_start} 09:15:00", f"{today_str} 15:30:00"]
+
+        # 5D Bounds
+        d5_dates = unique_dates[-5:] if len(unique_dates) >= 5 else unique_dates
+        df_5d = df_candles[ts_s.dt.date.isin(d5_dates)]
+        y_min_5d, y_max_5d = calculate_tight_y_axis_bounds(
+            df_5d, trade_plan, show_rr=False, buffer_pct=0.065, active_session_only=False
+        )
+        x_5d_start = d5_dates[0].strftime("%Y-%m-%d")
+        x_5d_range = [f"{x_5d_start} 09:15:00", f"{today_str} 15:30:00"]
+    else:
+        y_min_1d, y_max_1d = calculate_tight_y_axis_bounds(
+            df_candles, trade_plan, show_rr=show_rr, buffer_pct=0.065
+        )
+        x_1d_range = None
+        y_min_3d, y_max_3d = y_min_1d, y_max_1d
+        x_3d_range = None
+        y_min_5d, y_max_5d = y_min_1d, y_max_1d
+        x_5d_range = None
+
     ui_key = generate_chart_uirevision(instrument, timeframe, expiry)
 
+    # 9. Y-Axis Configuration (Dynamic 5-8% padding tightly framed to active session; user zoom preserved via uirevision)
     yaxis_config = dict(
         showgrid=True,
         gridcolor="#1F2430",
@@ -449,28 +530,98 @@ def build_15m_candlestick_figure(
         fixedrange=False,
         color="#E0E0E0",
         tickformat=",.1f",
+        range=[y_min_1d, y_max_1d],
+        autorange=False,
     )
-    if is_refresh:
-        # On background fragment refresh, do NOT reapply tight bounds so user pan/zoom persists
-        yaxis_config["autorange"] = True
-    else:
-        # On initial render or instrument/timeframe/expiry change, apply tight bounds
-        yaxis_config["range"] = [y_min, y_max]
 
-    # 9. Dark-Mode Layout & NSE Gapless Rangebreaks
+    # 10. X-Axis Configuration with Default 1D Viewport
+    xaxis_config = dict(
+        showgrid=True,
+        gridcolor="#1F2430",
+        rangeslider=dict(visible=False),
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),  # Hide weekends
+            dict(bounds=[15.5, 9.25], pattern="hour"),  # Hide 15:30 to 09:15 IST
+        ],
+        tickformat="%H:%M",
+        color="#9E9E9E",
+    )
+    if x_1d_range:
+        xaxis_config["range"] = x_1d_range
+
+    # 11. Interactive Dual-Axis Range Selector Buttons (1D, 3D, 5D, ALL)
+    # Dynamically recalculates both X and Y axis bounds on click without page reload
+    updatemenus = [
+        dict(
+            type="buttons",
+            direction="right",
+            active=0,
+            x=1.0,
+            xanchor="right",
+            y=1.04,
+            yanchor="bottom",
+            bgcolor="#1E222D",
+            bordercolor="#2A2E39",
+            borderwidth=1,
+            font=dict(color="#D1D4DC", size=11, family="monospace"),
+            pad=dict(r=2, t=2, b=2, l=2),
+            buttons=[
+                dict(
+                    label="1D",
+                    method="relayout",
+                    args=[{
+                        "xaxis.range": x_1d_range,
+                        "yaxis.range": [y_min_1d, y_max_1d],
+                        "xaxis.autorange": False,
+                        "yaxis.autorange": False,
+                    }],
+                ),
+                dict(
+                    label="3D",
+                    method="relayout",
+                    args=[{
+                        "xaxis.range": x_3d_range,
+                        "yaxis.range": [y_min_3d, y_max_3d],
+                        "xaxis.autorange": False,
+                        "yaxis.autorange": False,
+                    }],
+                ),
+                dict(
+                    label="5D",
+                    method="relayout",
+                    args=[{
+                        "xaxis.range": x_5d_range,
+                        "yaxis.range": [y_min_5d, y_max_5d],
+                        "xaxis.autorange": False,
+                        "yaxis.autorange": False,
+                    }],
+                ),
+                dict(
+                    label="ALL",
+                    method="relayout",
+                    args=[{
+                        "xaxis.autorange": True,
+                        "yaxis.autorange": True,
+                    }],
+                ),
+            ],
+        )
+    ]
+
+    # 12. Dark-Mode Layout & Persistent Viewport
     fig.update_layout(
         uirevision=ui_key,
         template="plotly_dark",
         paper_bgcolor="#0E1117",
         plot_bgcolor="#0E1117",
         height=650,
-        margin=dict(l=15, r=160, t=30, b=30),
+        margin=dict(t=50, b=20, l=30, r=40),
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.02,
+            y=1.04,
             xanchor="left",
-            x=0.01,
+            x=0.0,
             bgcolor="rgba(14, 17, 23, 0.8)",
             font=dict(size=11, color="#E0E0E0"),
         ),
@@ -480,31 +631,17 @@ def build_15m_candlestick_figure(
             font_size=12,
             font_family="monospace",
         ),
-        xaxis=dict(
-            showgrid=True,
-            gridcolor="#1F2430",
-            rangeslider=dict(visible=False),
-            rangeselector=dict(
-                buttons=list([
-                    dict(count=1, label="1D", step="day", stepmode="backward"),
-                    dict(count=3, label="3D", step="day", stepmode="backward"),
-                    dict(count=5, label="5D", step="day", stepmode="backward"),
-                    dict(step="all", label="ALL"),
-                ]),
-                bgcolor="#1E222D",
-                activecolor="#2962FF",
-                font=dict(color="#D1D4DC", size=11),
-                x=0.01,
-                y=0.98,
-            ),
-            rangebreaks=[
-                dict(bounds=["sat", "mon"]),  # Hide weekends
-                dict(bounds=[15.5, 9.25], pattern="hour"),  # Hide non-trading hours: 15:30 to 09:15
-            ],
-            tickformat="%H:%M",
-            color="#9E9E9E",
-        ),
+        xaxis=xaxis_config,
         yaxis=yaxis_config,
+        updatemenus=updatemenus,
+    )
+
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[15.5, 9.25], pattern="hour"),
+        ],
+        rangeslider_visible=False,
     )
 
     return fig

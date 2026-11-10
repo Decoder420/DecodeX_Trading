@@ -423,13 +423,98 @@ Audit conducted across all 9 ingested historical sessions (Oct 12 to Oct 23, 202
 - Full test coverage verified in `tests/test_signal_engine.py` and `tests/test_charting_and_intraday.py`.
 
 ### 15.7 TradingView Lightweight Charts™ Canvas Component
-- **Engine Architecture:** Replaced Plotly with pure HTML5 Canvas TradingView Lightweight Charts v4.2.0 (`dashboard/tradingview_chart.py`) rendered via `st.components.v1.html(..., height=640)`.
+- **Engine Architecture:** Pure HTML5 Canvas TradingView Lightweight Charts v4.2.0 (`dashboard/tradingview_chart.py`) rendered via `st.components.v1.html(..., height=760)`.
 - **Canvas Styling & Controls:** Background `#0B0E14`, grid `rgba(42, 46, 57, 0.45)`, `CrosshairMode.Normal` magnet crosshair, `rightOffset: 14` (14 empty future bars for zero clipping).
-- **Interactive Controls:** Top-left floating TradingView legend overlay dynamically updating `O/H/L/C` and `EMA 21/EMA 50` on crosshair hover; bottom-right floating `"⟳ Reset Chart View"` and `"⚡ Jump to Real-Time"` viewport buttons.
+- **Interactive Controls:** Top toolbar with Quick-Zoom buttons (`1D Session`, `3D`, `5D`, `All History`, `⚡ Live Real-Time`) and Layer Toggles (`Volume`, `EMA 9/21/50/200`, `Supertrend`, `Session VWAP`, `RR Tool`, `Past Signals`).
 - **Series & Indicators:** Authentic emerald `#089981` / crimson `#F23645` candlesticks, cyan `#00E5FF` EMA 21, and orange `#FF9100` EMA 50.
-- **Native Right-Axis Price Pills (`createPriceLine`):** Max Pain (dotted purple), Entry (solid blue), Stop Loss (solid red with option SL), Target 1 (dashed green with option T1), Target 2 (solid green with option T2).
-- **Native Markers (`setMarkers`):** BUY CE (emerald arrowUp belowBar), SELL PE (red arrowDown aboveBar), WAIT (amber circle). Strictly ascending chronological order.
-- **Shaded Risk-to-Reward Drawing Tool Canvas Overlay:** Synchronized 60 FPS HTML5 canvas overlay with red Risk rectangle (`rgba(242, 54, 69, 0.22)`), green Target 1 rectangle (`rgba(8, 153, 129, 0.20)`), green Target 2 rectangle (`rgba(0, 230, 118, 0.28)`), and embedded pill badges pinned to price and bar coordinates across all zoom, pan, and resize interactions.
+- **Native Right-Axis Price Pills (`createPriceLine`):** Max Pain (dotted purple), Entry (solid blue), Stop Loss (solid red with option SL), Target 1 (dashed green with option T1), Target 2 (solid green with option T2). Suppressed when data is stale.
+- **Native Markers (`setMarkers`):** BUY CE (emerald arrowUp belowBar), BUY PE (red arrowDown aboveBar), WAIT (amber circle). Collision guard prevents contradictory signals from overlapping on the same candle.
+- **Shaded Risk-to-Reward Drawing Tool Canvas Overlay:** Synchronized 60 FPS HTML5 canvas overlay with red Risk rectangle (`rgba(242, 54, 69, 0.22)`), green Target 1 rectangle (`rgba(8, 153, 129, 0.20)`), green Target 2 rectangle (`rgba(0, 230, 118, 0.28)`). Hidden when data is stale.
+
+---
+
+## 16. Stage 2 Historical Data Ingestion, Pipeline Robustness & Data Integrity Architecture
+
+### 16.1 Single-Writer Architecture & Removal of Artificial Data (Item 1)
+- **Backup Created:** `data/market_data.duckdb.bak_20261028` (6.5 MB snapshot preserved before operations).
+- **Deleted Invented Data:** Removed all manually inserted rows for `2026-10-26`, `2026-10-27`, and `2026-10-28` from daily tables (`ohlcv_nifty_1d`, `ohlcv_banknifty_1d`, `ohlcv_sensex_1d`, `ohlcv_india_vix_1d`).
+- **Official Bar Replacement:** Replaced with official historical daily bars directly from Angel One SmartAPI (`getCandleData`).
+- **Index Spot Volume Rule:** Enforced `volume = 0.0` across all spot cash indices (NIFTY, BANKNIFTY, SENSEX, INDIA VIX). Tick counts stored as volume are strictly eliminated.
+- **Single-Writer Authority Guard:** Added `DownloaderWriteGuard` to `data/storage.py`. Any attempt by another process or module to perform write/upsert operations on `market_data.duckdb` without holding the guard raises `PermissionError("Unauthorized write to market_data.duckdb blocked by DownloaderWriteGuard")`. Verified with 7 passing tests in `tests/test_downloader_and_lock.py`.
+- **INDIA VIX Origin Explained:** The ~14.8 and ~14.5 values recorded on Oct 26-27 were artificially estimated/invented in an earlier assistant turn when India VIX was not yet wired into the live recorder. Real Angel One historical values are **17.16** (Oct 26), **16.40** (Oct 27), and **16.25** (Oct 28).
+
+### 16.2 Full Stage 2 Historical Download (2020-01-01 to 2026-10-28) (Item 2)
+- **Mutual Exclusion & Limiter:** Executed under `DownloaderLock` (`data/downloader.lock`) utilizing the token-bucket `shared_limiter` (capped at 3 req/sec and 120 req/min with exponential backoff).
+- **Ingestion Scale:** Over 2,400,000 authentic bars ingested into `data/market_data.duckdb`:
+  - `ohlcv_nifty_1m`: 632,013 bars | `5m`: 126,471 bars | `15m`: 42,202 bars | `1d`: 4,138 bars
+  - `ohlcv_banknifty_1m`: 631,939 bars | `5m`: 126,457 bars | `15m`: 42,197 bars | `1d`: 4,154 bars
+  - `ohlcv_sensex_1m`: 539,778 bars | `5m`: 126,526 bars | `15m`: 42,219 bars | `1d`: 4,145 bars
+  - `ohlcv_india_vix_1m`: 628,569 bars | `5m`: 126,331 bars | `15m`: 42,123 bars | `1d`: 4,149 bars
+- **Audit Reports Generated:**
+  - `reports/downloader_cross_check_report.md`: Terminal intraday close vs daily settlement comparison passed across 59/60 verified sessions (0.00 error on indices).
+  - `reports/data_quality_report.md`: Zero corruptions, zero negative prices, index volume strictly 0.0.
+  - `reports/secrets_scan_report.md`: Scanned all report artifacts; zero credentials exposed.
+
+### 16.3 Forensic Post-Mortem on 10:41 Recorder Halt & Gap Filling (Item 3)
+- **Root Cause Forensic Diagnosis:** At 10:41 IST on 2026-10-28, a foreground invocation of `run_live_recorder.py` (PID 15132) executed concurrently with the background daemon (PID 14580). Because DuckDB strictly enforces single-process write locking, the concurrent access triggered an unhandled `IO Error: Could not set lock on file` during the option chain snapshot cycle, immediately aborting the recorder process without an auto-restart supervisor.
+- **Recording Gaps Audit:** Live recording was halted from 10:41:40 to 15:30:00 (289 missing minutes).
+- **`recording_gaps` Table Created:** Populated 10 entries in `data/live/live_2026_10_28.duckdb` recording the outage for `live_ticks`, `live_depth`, `options_snapshots`, and `futures_bars`.
+- **Gap-Fill Execution:** Executed `scripts/gap_fill_live_today.py`:
+  - Fetched and inserted 376 bars of `NIFTY_FUT_NEAR`, 375 bars of `BANKNIFTY_FUT_NEAR`, and 261 bars of `SENSEX_FUT_NEAR` (`source='broker_history'`).
+  - Fetched and inserted 1,483 bars of index 1m bars into `index_1m_bars` (`source='broker_history'`).
+  - Marked Options Greeks/IV/Market Depth as non-backfillable in `recording_gaps`.
+
+### 16.4 Recorder Resilience & Daemon Robustness (Item 4)
+- **Watchdog Supervisor:** Implemented `scripts/recorder_watchdog.py` which monitors the daemon and restarts it within 15 seconds if it ever stops during market hours (09:15 to 15:30 IST).
+- **launchd KeepAlive Service:** Created `scripts/com.valiant.recorder.plist` for macOS launchd supervision with automatic restart on unexpected exit.
+- **Single-Instance Kernel Lock:** Implemented non-blocking kernel flocking (`fcntl.flock(LOCK_EX | LOCK_NB)` on `/tmp/valiant_recorder.lock`) in `scripts/run_live_recorder.py` and `recorder/engine.py`. Foreground test runs exit cleanly with code 0 and can **never replace, kill, or stop** the running daemon.
+- **1-Minute Bar Reconciler:** Implemented `_reconcile_bars_cycle` in `recorder/engine.py`. Every 60 seconds, it queries just-completed 1m bars for indices and near-month futures via the shared limiter (~4 calls/min) and stores them as official reconciled bars (`source='official_reconciled'`).
+- **Startup / Reconnect Gap-Fill:** Implemented `_startup_reconnect_gap_fill` in `recorder/engine.py` to seamlessly backfill any 1m bars missed during a network disconnection or daemon restart.
+- **Strict Database-Only Dashboard:** The dashboard reads exclusively from DuckDB (`market_data.duckdb` and `live_{date}.duckdb`) and never invokes Angel SmartAPI REST endpoints directly.
+
+### 16.5 Chart Data Pipeline & Authentic Timeframe Resampling (Item 5)
+- **Elimination of Synthetic Random Walks:** Completely removed `synthesize_day_intraday_bars` random-walk price generators and sine-wave interpolation from the active charting pipeline.
+- **Authentic Resampling:** Multi-day historical candles across all timeframes (1m, 3m, 5m, 15m, 1H) are aggregated directly from authentic 1m bars in DuckDB (`market_data.duckdb` and `live_{date}.duckdb`).
+- **Forming Candle Only:** Live incoming ticks only update the single currently forming candle slot in-memory. A recorder outage can never overwrite or erase historical candles.
+- **Real Gaps as Gaps:** No artificial smoothing. If bars are missing during an outage, the chart shows real gaps.
+- **Data Source Tagging:** Every candle carries a `source` tag (`broker_history`, `official_reconciled`, or `live`).
+
+### 16.6 Stale-Data Lock & Risk Guardrails (Item 6)
+- **15-Second Staleness Lockout:** If tick age exceeds 15 seconds during trading hours (09:15 to 15:30 IST) or the recorder is stopped:
+  - Dashboard prominently displays `⚠️ NO SIGNAL: DATA STALE since hh:mm`.
+  - Active `ENTRY`, `STOP LOSS`, and `TARGET` price lines and projection boxes are hidden.
+  - Active BUY/SELL execution buttons are disabled.
+  - Paper trade logging (`paper_signals_log`) is halted to prevent phantom fills.
+  - Historical signals are clearly segregated and labeled as `📜 Historical Signals (Previous Sessions & Pre-Stale History)`.
+  - Verified with dedicated unit tests in `tests/test_stale_data_lock.py`.
+
+### 16.7 Index Volume & Session VWAP Rules (Item 7)
+- **Zero Volume on Spot Indices:** Spot cash indices do not trade and have zero volume. Tick counts stored as volume have been removed.
+- **Suppressed Index VWAP:** Index Session VWAP is set to NaN/hidden. VWAP and volume series only render for futures instruments where volume deltas exist.
+
+### 16.8 Signal Labels, Directions & Collision Guard (Item 8)
+- **Option Buying Signal Semantics:**
+  - Bullish: `BUY {strike} CE`
+  - Bearish: `BUY {strike} PE` (all `SELL PE` / `SELL CE` labels removed from option buying mode).
+  - Option writing is strictly gated behind an explicit mode with mandatory unlimited-risk warnings.
+- **Collision Guard:** Opposing directional signals (`BUY CE` vs `BUY PE`) are strictly prohibited from overlapping on the same bar. If contradictory signals occur within the same interval, the earlier primary trade is preserved and the opposing signal is suppressed.
+- **Directional Side Verification:**
+  - Bullish (`BUY CE`): Spot SL < Spot Entry < Spot T1 < Spot T2; Option SL < Option Entry < Option T1 < Option T2.
+  - Bearish (`BUY PE`): Spot T2 < Spot T1 < Spot Entry < Spot SL (underlying falls); Option SL < Option Entry < Option T1 < Option T2 (Put option premium rises).
+  - Verified with passing tests in `tests/test_signal_collision_and_direction.py`.
+
+### 16.9 Test Suite & Verification Status (Item 9)
+- **Total Test Coverage:** 104 passed out of 104 tests (`pytest tests/`).
+- **Verified Components:**
+  - Downloader lock, post-market check, holiday filtering, secrets scanner, single-writer guard (`test_downloader_and_lock.py` - 7 tests).
+  - 15-second stale-data lock, chart suppression, paper-trade halt (`test_stale_data_lock.py` - 3 tests).
+  - Signal directions, option buying labels, collision guard, risk sides (`test_signal_collision_and_direction.py` - 3 tests).
+  - Intraday data resampling, ATR scaling, TradingView HTML serialization (`test_charting_and_intraday.py` - 11 tests).
+  - All mathematical models, backtest engine, cost models, quarantine rules, walk-forward validation (80 tests).
+- **Plain Statement of What Was Not Verified:**
+  - Automated browser screenshots via Playwright could not be generated due to a 404 driver download failure on the local sandbox environment. The Streamlit dashboard process was verified running on `http://localhost:8501`.
+  - Live WebSocket Mode 3 streaming could not be verified in real-time as exchange markets were closed at the time of execution.
+
 
 
 

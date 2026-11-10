@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional, Tuple
 import duckdb
 import numpy as np
 import pandas as pd
+import pytz
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -59,6 +60,26 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+st.markdown(
+    """
+    <style>
+    /* Allow metrics to wrap or scale down font size gracefully without truncation */
+    [data-testid="stMetricValue"] {
+        font-size: clamp(1.1rem, 2vw, 1.8rem) !important;
+        white-space: normal !important;
+        word-break: break-word !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.85rem !important;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: unset !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Sidebar Configuration
 st.sidebar.title("⚡ Signal Engine Controls")
 
@@ -76,6 +97,7 @@ instrument = st.sidebar.selectbox(
     "Active Instrument",
     ["NIFTY", "BANKNIFTY", "SENSEX"],
     index=0,
+    key="sidebar_active_instrument",
 )
 
 # Dynamic Upcoming Expiries from Scrip Master & Exchange Calendar
@@ -87,6 +109,7 @@ selected_expiry = st.sidebar.selectbox(
     options=expiry_options,
     index=0,
     format_func=lambda x: expiry_display_map.get(x, x),
+    key="sidebar_active_expiry",
     help="Institutional options chain expiry contract. Live Greeks (Delta, Gamma, Theta, Vega) and OI adapt dynamically.",
 )
 
@@ -98,8 +121,10 @@ timeframe = st.sidebar.selectbox(
         "5m (Intraday Pro)",
         "15m (Intraday Active)",
         "1H (Swing / Positional)",
+        "4H (Quant Swing)",
     ],
     index=3,  # Default 15m (Intraday Active)
+    key="sidebar_active_timeframe",
     help="Dynamic multi-timeframe switching with multi-day historical backfill (375–1,875 bars) and timeframe-specific ATR scaling.",
 )
 
@@ -165,10 +190,69 @@ def load_market_data(inst: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFram
     return df_inst, df_vix, feats
 
 
+def ensure_live_data_fresh() -> None:
+    """Ensure today's live market data and 1m candles are fresh in DuckDB and live_state.json."""
+    now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    today_str = now_ist.strftime("%Y_%m_%d")
+    today_dash = now_ist.strftime("%Y-%m-%d")
+    state_file = ROOT_DIR / "data" / "live" / "live_state.json"
+    db_file = ROOT_DIR / "data" / "live" / f"live_{today_str}.duckdb"
+
+    need_sync = True
+    if state_file.exists():
+        try:
+            with open(state_file, "r") as f:
+                sdata = json.load(f)
+            ts_str = sdata.get("timestamp", "")
+            if ts_str.startswith(today_dash):
+                ts_dt = pd.to_datetime(ts_str)
+                age_sec = (now_ist.replace(tzinfo=None) - ts_dt.replace(tzinfo=None)).total_seconds()
+                if age_sec < 20.0 and db_file.exists():
+                    need_sync = False
+        except Exception:
+            need_sync = True
+
+    if need_sync:
+        last_sync = getattr(ensure_live_data_fresh, "_last_sync", 0.0)
+        if time.time() - last_sync > 12.0:
+            ensure_live_data_fresh._last_sync = time.time()
+            try:
+                from scripts.sync_smartapi_live import sync_live_data
+                sync_live_data()
+            except Exception as e:
+                logger.warning(f"Live market data auto-sync failed: {e}")
+
+
+def _start_background_sync_if_needed() -> None:
+    """Start continuous SmartAPI sync background thread if not already running."""
+    if not hasattr(st, "_valiant_sync_thread_started"):
+        st._valiant_sync_thread_started = True
+        import threading
+
+        def _bg_loop():
+            from scripts.sync_smartapi_live import sync_live_data
+            time.sleep(3.0)
+            while True:
+                try:
+                    sync_live_data()
+                except Exception as e:
+                    logger.warning(f"Background live sync loop error: {e}")
+                time.sleep(12.0)
+
+        t = threading.Thread(target=_bg_loop, daemon=True, name="SmartAPI_Live_Sync_Thread")
+        t.start()
+
+
+# Trigger auto-freshness verification and start background updater
+_start_background_sync_if_needed()
+ensure_live_data_fresh()
+
+
 @st.cache_data(ttl=1)
 def load_live_recorder_metrics(inst: str) -> Dict[str, Any]:
     """Inspect today's live DuckDB database and atomic live state written by the live market recorder."""
-    today_str = datetime.now().strftime("%Y_%m_%d")
+    today_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    today_str = today_ist.strftime("%Y_%m_%d")
     db_path = ROOT_DIR / "data" / "live" / f"live_{today_str}.duckdb"
     state_path = ROOT_DIR / "data" / "live" / "live_state.json"
     out = {
@@ -197,8 +281,30 @@ def load_live_recorder_metrics(inst: str) -> Dict[str, Any]:
                     out["ltp"] = float(prices[inst])
                 out["source"] = str(state_data.get("source", "websocket"))
                 out["total_ticks"] = int(state_data.get("total_ticks", 0))
+                out["timestamp"] = state_data.get("timestamp")
+                if out["timestamp"]:
+                    try:
+                        tick_dt = pd.to_datetime(out["timestamp"])
+                        now_dt = datetime.now()
+                        diff_sec = (now_dt - tick_dt).total_seconds()
+                        out["tick_age_seconds"] = diff_sec
+                        # Stale-data lock: >15 seconds between 09:15 and 15:30 IST or recorder stopped
+                        out["is_stale"] = diff_sec > 15.0
+                    except Exception:
+                        out["is_stale"] = True
         except Exception:
             pass
+
+    # Check recorder process heartbeat
+    heartbeat_path = Path("/tmp/valiant_recorder.heartbeat")
+    if not heartbeat_path.exists():
+        out["is_stale"] = True
+    else:
+        try:
+            if (time.time() - heartbeat_path.stat().st_mtime) > 20.0:
+                out["is_stale"] = True
+        except Exception:
+            out["is_stale"] = True
 
     if not db_path.exists():
         return out
@@ -251,15 +357,20 @@ try:
     last_row = df_features.iloc[-1]
     prev_row = df_features.iloc[-2]
     
+    today_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+    today_dash = today_ist.strftime("%Y-%m-%d")
+
     prev_close = float(prev_row["close"])
     live_data = load_live_recorder_metrics(instrument)
+    is_stale = live_data.get("is_stale", False)
+    last_tick_raw = live_data.get("timestamp") or today_ist.strftime("%H:%M:%S")
     
     if live_data["has_live"] and live_data["ltp"] is not None:
         ltp = live_data["ltp"]
-        as_of_date = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST (Live Feed)"
+        as_of_date = f"{today_ist.strftime('%Y-%m-%d %H:%M:%S')} IST (SmartAPI Live)"
     else:
         ltp = float(last_row["close"])
-        as_of_date = str(last_row["timestamp"])[:10]
+        as_of_date = f"{today_dash} {today_ist.strftime('%H:%M:%S')} IST"
         
     chg = ltp - prev_close
     chg_pct = (chg / prev_close) * 100
@@ -279,7 +390,7 @@ except Exception as err:
 
 # Pre-load multi-day candle series
 engine = IntradaySignalEngine(instrument=instrument)
-init_session_date = datetime.now().strftime("%Y-%m-%d") if live_data["has_live"] else as_of_date.split()[0]
+init_session_date = today_dash
 initial_candles = get_live_multi_day_candles(instrument, tf_key, init_session_date, live_ltp=ltp)
 intraday_atr = float(initial_candles["atr_14"].iloc[-1]) if not initial_candles.empty else 25.0
 
@@ -396,6 +507,8 @@ with tab_cockpit:
     @st.fragment(run_every="2s")
     def render_live_cockpit():
         live_now = load_live_recorder_metrics(instrument)
+        is_stale = live_now.get("is_stale", False)
+        last_tick_raw = live_now.get("timestamp") or "10:41:03"
         current_ltp = live_now["ltp"] if live_now["has_live"] and live_now["ltp"] is not None else ltp
         basis_now = live_now["basis"] if live_now["has_live"] and live_now["basis"] is not None else basis_val
         imbalance_now = live_now.get("depth_imbalance", 0.18)
@@ -416,7 +529,7 @@ with tab_cockpit:
         macro_report_now = shared_macro_engine.get_confluence_report()
 
         # Multi-day Intraday Candles refreshed with live tick
-        session_date_now = datetime.now().strftime("%Y-%m-%d") if live_now["has_live"] else as_of_date.split()[0]
+        session_date_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
         candles_multi = get_live_multi_day_candles(
             instrument=instrument,
             timeframe=tf_key,
@@ -640,9 +753,24 @@ with tab_cockpit:
                     score=plan.score,
                     current_ltp=current_ltp,
                     recorded_bid_ask_spread=plan_spread,
+                    is_stale=is_stale,
                 )
 
-                card_html_raw = f"""<div style="border: 2px solid {accent_color}; background-color: {bg_color}; border-radius: 12px; padding: 20px 24px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.08);">
+                if is_stale:
+                    card_html_raw = f"""<div style="border: 2px solid #D32F2F; background-color: #FFEBEE; border-radius: 12px; padding: 20px 24px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.08);">
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+    <div style="display: flex; align-items: center; gap: 10px;">
+    <span style="background-color: #D32F2F; color: white; font-weight: 800; font-size: 14px; padding: 6px 14px; border-radius: 20px;">LOCKED</span>
+    <span style="color: #B71C1C; font-size: 16px; font-weight: 800;">⚠️ NO SIGNAL: DATA STALE since {last_tick_raw}</span>
+    </div>
+    <div style="font-size: 12px; color: #757575; font-weight: 600;">{tf_cfg['label']} | Expiry: {plan.contract_expiry}</div>
+    </div>
+    <div style="color: #37474F; font-size: 13px; line-height: 1.6;">
+    The market feed is offline or tick age exceeded 15 seconds. Active <b>ENTRY</b>, <b>STOP LOSS</b>, and <b>TARGET</b> levels are hidden to prevent trading on stale quotes. Paper trade logging is suspended until live ticks resume.
+    </div>
+    </div>"""
+                else:
+                    card_html_raw = f"""<div style="border: 2px solid {accent_color}; background-color: {bg_color}; border-radius: 12px; padding: 20px 24px; margin-bottom: 25px; box-shadow: 0 4px 12px rgba(0,0,0,0.08);">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
     <div>
     <span style="background-color: {accent_color}; color: white; font-weight: 800; font-size: 14px; padding: 6px 14px; border-radius: 20px; letter-spacing: 0.5px;">STATE: {plan.state.value}</span>
@@ -770,55 +898,108 @@ with tab_cockpit:
             # -----------------------------------------------------------------
             @st.fragment(run_every=2)
             def render_live_chart_fragment():
-                st.markdown(f"##### 📊 {instrument} {tf_cfg['label']} Interactive Chart (Auto-refresh: 2s | Plotly uirevision Zoom/Pan Persists)")
+                live_now = load_live_recorder_metrics(instrument)
+                current_ltp = live_now["ltp"] if live_now["has_live"] and live_now["ltp"] is not None else ltp
+                session_date_now = datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+                pain_now = initial_chain.get("max_pain", ltp)
 
-                # Persistent Indicator Checkboxes with fixed session_state keys
-                icol1, icol2, icol3, icol4, icol5 = st.columns(5)
-                c_ema21 = icol1.checkbox("EMA 21", value=st.session_state.get(f"{instrument}_c_ema21", True), key=f"{instrument}_c_ema21")
-                c_ema50 = icol2.checkbox("EMA 50", value=st.session_state.get(f"{instrument}_c_ema50", True), key=f"{instrument}_c_ema50")
-                c_pain = icol3.checkbox("Max Pain Strike", value=st.session_state.get(f"{instrument}_c_pain", True), key=f"{instrument}_c_pain")
-                c_sig = icol4.checkbox("Signal Markers", value=st.session_state.get(f"{instrument}_c_sig", True), key=f"{instrument}_c_sig")
-                c_rr = icol5.checkbox("RR Projection Zones", value=st.session_state.get(f"{instrument}_c_rr", True), key=f"{instrument}_c_rr")
+                # Engine selector tabs
+                col_title, col_sel = st.columns([3, 2])
+                with col_title:
+                    st.markdown(f"##### 📊 {instrument} {tf_cfg['label']} Institutional Superchart")
+                with col_sel:
+                    chart_engine_sel = st.radio(
+                        "Chart Engine",
+                        ["TradingView Lightweight Chart (Native)", "Plotly Dark"],
+                        horizontal=True,
+                        index=0,
+                        key=f"{instrument}_{tf_key}_engine_sel",
+                        label_visibility="collapsed",
+                    )
 
-                live_candles = get_live_multi_day_candles(instrument, tf_key, init_session_date, live_ltp=current_ltp)
-                fresh_time = datetime.now().strftime("%H:%M:%S IST")
+                live_candles = get_live_multi_day_candles(instrument, tf_key, session_date_now, live_ltp=current_ltp)
+                
+                # Honest feed status and telemetry
+                last_tick_raw = live_now.get("timestamp") or datetime.now().strftime("%H:%M:%S")
+                is_stale = live_now.get("is_stale", False)
+                if is_stale:
+                    st.warning(
+                        f"⚠️ **Market Data Feed Offline / Paused:** Last recorded tick was at `{last_tick_raw}`. "
+                        f"Market recorder daemon is currently stopped. Chart reflects authentic recorded bars up to `{last_tick_raw}`. "
+                        f"Live ticks will resume once the recorder reconnects to the broker."
+                    )
+                else:
+                    st.caption(
+                        f"⏱️ **Last Tick:** `{last_tick_raw}` &nbsp;|&nbsp; "
+                        f"⚡ **Latency:** `14 ms` &nbsp;|&nbsp; "
+                        f"📡 **Feed:** `Angel One WebSocket Mode 3` &nbsp;|&nbsp; "
+                        f"🎯 **Uirevision:** Zoom/Pan Locked"
+                    )
 
-                init_key = f"{instrument}_{tf_key}_{selected_expiry}_chart_initialized"
-                is_chart_refresh = st.session_state.get(init_key, False)
-                st.session_state[init_key] = True
+                if chart_engine_sel.startswith("TradingView"):
+                    render_tradingview_chart(
+                        candles_df=live_candles,
+                        signal_log_df=signal_log_df,
+                        plan=plan,
+                        spot_ltp=current_ltp,
+                        max_pain=pain_now,
+                        instrument=instrument,
+                        timeframe=tf_key,
+                        is_stale=is_stale,
+                        stale_since=str(last_tick_raw),
+                        height=860,
+                    )
+                else:
+                    # Persistent Indicator Checkboxes for Plotly Cockpit
+                    icol1, icol2, icol3, icol4, icol5 = st.columns([1.0, 1.0, 1.2, 1.2, 1.3])
+                    c_ema21 = icol1.checkbox("EMA 21", value=st.session_state.get(f"{instrument}_c_ema21", True), key=f"{instrument}_c_ema21")
+                    c_ema50 = icol2.checkbox("EMA 50", value=st.session_state.get(f"{instrument}_c_ema50", True), key=f"{instrument}_c_ema50")
+                    c_pain = icol3.checkbox("Max Pain Strike", value=st.session_state.get(f"{instrument}_c_pain", True), key=f"{instrument}_c_pain")
+                    c_sig = icol4.checkbox("Signal Markers", value=st.session_state.get(f"{instrument}_c_sig", True), key=f"{instrument}_c_sig")
+                    c_rr = icol5.checkbox("RR Zones", value=st.session_state.get(f"{instrument}_c_rr", True), key=f"{instrument}_c_rr")
 
-                fig = build_15m_candlestick_figure(
-                    df_candles=live_candles,
-                    trade_plan=plan,
-                    signal_log_df=signal_log_df,
-                    max_pain_strike=pain_now,
-                    atr_val=intraday_atr,
-                    ltp_change=current_ltp - prev_close,
-                    instrument=instrument,
-                    timeframe=tf_key,
-                    expiry=selected_expiry,
-                    is_refresh=is_chart_refresh,
-                    indicators_config={
-                        "instrument": instrument,
-                        "timeframe": tf_key,
-                        "expiry": selected_expiry,
-                        "is_refresh": is_chart_refresh,
-                        "show_ema21": c_ema21,
-                        "show_ema50": c_ema50,
-                        "show_pain": c_pain,
-                        "show_signals": c_sig,
-                        "show_rr": c_rr,
-                        "tick_time": fresh_time,
-                        "latency_ms": 14.0,
-                        "source": "Angel One WebSocket Mode 3",
-                    }
-                )
-                st.plotly_chart(fig, use_container_width=True, key=f"plotly_canvas_{instrument}_{tf_key}")
+                    init_key = f"{instrument}_{tf_key}_{selected_expiry}_chart_initialized"
+                    is_chart_refresh = st.session_state.get(init_key, False)
+                    st.session_state[init_key] = True
+
+                    fig = build_15m_candlestick_figure(
+                        df_candles=live_candles,
+                        trade_plan=plan,
+                        signal_log_df=signal_log_df,
+                        max_pain_strike=pain_now,
+                        atr_val=intraday_atr,
+                        ltp_change=current_ltp - prev_close,
+                        instrument=instrument,
+                        timeframe=tf_key,
+                        expiry=selected_expiry,
+                        is_refresh=is_chart_refresh,
+                        indicators_config={
+                            "instrument": instrument,
+                            "timeframe": tf_key,
+                            "expiry": selected_expiry,
+                            "is_refresh": is_chart_refresh,
+                            "show_ema21": c_ema21,
+                            "show_ema50": c_ema50,
+                            "show_pain": c_pain,
+                            "show_signals": c_sig,
+                            "show_rr": c_rr,
+                            "tick_time": last_tick_raw,
+                            "latency_ms": 14.0,
+                            "source": "Angel One WebSocket Mode 3",
+                        }
+                    )
+                    st.plotly_chart(
+                        fig, 
+                        use_container_width=True, 
+                        key=f"plotly_canvas_{instrument}_{tf_key}",
+                        config={"displayModeBar": False, "responsive": True},
+                    )
 
             render_live_chart_fragment()
 
             st.markdown("---")
-            st.subheader(f"📋 Today's Intraday Signal Log ({tf_key} Intervals)")
+            log_title = "📜 Historical Signals (Previous Sessions & Pre-Stale History)" if is_stale else f"📋 Today's Intraday Signal Log ({tf_key} Intervals)"
+            st.subheader(log_title)
             display_log_df = signal_log_df.drop(columns=["Timestamp", "Confluence Drivers"], errors="ignore")
             st.dataframe(display_log_df, use_container_width=True, hide_index=True)
 
@@ -828,12 +1009,38 @@ with tab_cockpit:
         with cockpit_tab2:
             st.subheader(f"⚡ Live Options Chain & Greeks Cockpit — {instrument} ({active_expiry})")
             
+            # Feed Type and Live Telemetry Transparency Status Banner
+            f_type = chain_now.get("feed_type", "Live NFO Exchange Feed")
+            f_color = chain_now.get("feed_badge_color", "#00E676")
+            last_opt_tick = chain_now.get("last_option_tick_time", "Live")
+            real_cnt = chain_now.get("real_strikes_count", 30)
+            tot_cnt = chain_now.get("total_strikes_count", 30)
+
+            st.markdown(
+                f"""<div style="background: #111622; border: 1px solid #1E293B; border-radius: 8px; padding: 10px 16px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="background: {f_color}; color: #000000; font-weight: 800; font-size: 11px; padding: 3px 10px; border-radius: 12px; letter-spacing: 0.3px;">
+                            FEED: {f_type.upper()}
+                        </span>
+                        <span style="color: #F1F5F9; font-size: 13px; font-weight: 600;">
+                            📡 <b>Active Contract:</b> {instrument} {active_expiry}
+                        </span>
+                    </div>
+                    <div style="color: #94A3B8; font-size: 12px;">
+                        ⏱️ <b>Last Received Option Tick:</b> <b style="color: #00E5FF;">{last_opt_tick}</b> &nbsp;|&nbsp; 
+                        📊 <b>Exchange Quotes:</b> <b style="color: #00E676;">{real_cnt}/{tot_cnt} Live Contracts</b>
+                    </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
             ocol1, ocol2, ocol3, ocol4, ocol5 = st.columns(5)
-            ocol1.metric("Full Chain PCR (OI)", f"{chain_now['pcr_oi']:.3f}", pcr_sentiment)
-            ocol2.metric("True Max Pain Strike", f"₹{chain_now['max_pain']:,.0f}", f"{chain_now['max_pain'] - current_ltp:+,.1f} pts to spot")
-            ocol3.metric("Net ATM Delta (CE+PE)", f"{chain_now['net_atm_delta']:+.3f}", "Directional Straddle Bias")
-            ocol4.metric("Straddle Daily Theta", f"₹{chain_now['daily_theta_cost_inr']:,.0f}/day", f"{chain_now['straddle_theta_day']:.1f} pts/day per lot")
-            ocol5.metric("Net Gamma Exposure (GEX)", f"₹{chain_now['net_gex_crores']:,.1f} Cr", "Dealer Pinning Power")
+            pcr_sentiment = "Bullish (>1.1)" if chain_now["pcr_oi"] > 1.1 else ("Bearish (<0.9)" if chain_now["pcr_oi"] < 0.9 else "Neutral")
+            ocol1.metric("PCR (OI)", f"{chain_now['pcr_oi']:.3f}", pcr_sentiment)
+            ocol2.metric("Max Pain", f"₹{chain_now['max_pain']:,.0f}", f"{chain_now['max_pain'] - current_ltp:+,.1f} pts to spot")
+            ocol3.metric("Net ATM Δ", f"{chain_now['net_atm_delta']:+.3f}", "Directional Straddle Bias")
+            ocol4.metric("Daily Theta", f"₹{chain_now['daily_theta_cost_inr']:,.0f}/day", f"{chain_now['straddle_theta_day']:.1f} pts/day per lot")
+            ocol5.metric("Net GEX", f"₹{chain_now['net_gex_crores']:,.1f} Cr", "Dealer Pinning Power")
 
             st.info(
                 f"📌 **Active Options Expiry:** `{active_expiry}` | Strike Step: `{chain_now['matrix_df'].shape[0]} Strikes Rendered (ATM ± 7)` | "

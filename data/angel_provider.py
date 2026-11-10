@@ -36,6 +36,7 @@ class AngelOneProvider(BaseDataProvider):
         "NSE:BANKNIFTY": {"token": "99926009", "symbol": "Nifty Bank"},
         "BSE:SENSEX": {"token": "99919000", "symbol": "Sensex"},
         "NSE:INDIA VIX": {"token": "99926017", "symbol": "India VIX"},
+        "NSE:INDIA_VIX": {"token": "99926017", "symbol": "India VIX"},
         "NSE:VIX": {"token": "99926017", "symbol": "India VIX"},
     }
 
@@ -55,6 +56,8 @@ class AngelOneProvider(BaseDataProvider):
             self.cfg.get("data.provider.angelone.cache_path", "data/cache/angel_scrip_master.json")
         )
         self.cache_ttl_hours = self.cfg.get("data.provider.angelone.cache_ttl_hours", 24)
+        self.session_cache_path = PROJECT_ROOT / "data" / "cache" / "angel_session.json"
+        self.http_session: Optional[requests.Session] = None
 
         self.client: Any = None
         self.authenticated = False
@@ -82,34 +85,134 @@ class AngelOneProvider(BaseDataProvider):
             logger.warning(msg)
             raise ValueError(msg)
 
-    def connect(self) -> bool:
-        """Authenticate with Angel One SmartAPI using TOTP."""
+    def _init_http_session(self) -> None:
+        """Initialize a persistent requests.Session with connection pooling."""
+        if self.http_session is None:
+            self.http_session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=10,
+                pool_maxsize=10,
+                max_retries=3,
+            )
+            self.http_session.mount("https://", adapter)
+            self.http_session.mount("http://", adapter)
+
+    def _patch_client_session(self) -> None:
+        """Patch client._request to route through persistent keep-alive session with browser headers."""
+        if not self.client:
+            return
+
+        self._init_http_session()
+
+        orig_rh = self.client.requestHeaders
+
+        def _patched_request_headers():
+            h = orig_rh()
+            h["Content-Type"] = "application/json"
+            h["Content-type"] = "application/json"
+            h["User-Agent"] = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+            )
+            return h
+
+        self.client.requestHeaders = _patched_request_headers
+
+        from urllib.parse import urljoin
+
+        def _session_request(route, method, parameters=None):
+            params = parameters.copy() if parameters else {}
+            uri = self.client._routes[route].format(**params)
+            url = urljoin(self.client.root, uri)
+            headers = self.client.requestHeaders()
+            if self.client.access_token:
+                headers["Authorization"] = f"Bearer {self.client.access_token}"
+
+            last_exc = None
+            for attempt in range(4):
+                try:
+                    resp = self.http_session.request(
+                        method,
+                        url,
+                        data=json.dumps(params) if method in ["POST", "PUT"] else None,
+                        params=json.dumps(params) if method in ["GET", "DELETE"] else None,
+                        headers=headers,
+                        timeout=self.client.timeout or 10,
+                    )
+                    data = resp.json()
+                    return data
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 3:
+                        time.sleep(0.75 * (attempt + 1))
+            raise last_exc
+
+        self.client._request = _session_request
+
+    def connect(self, force_login: bool = False) -> bool:
+        """Authenticate with Angel One SmartAPI using cached token or TOTP."""
         if self.authenticated and self.client:
             return True
+
+        self._init_http_session()
+
+        # Check cached session token first (valid up to 14 hours)
+        if not force_login and self.session_cache_path.exists():
+            try:
+                with open(self.session_cache_path, "r", encoding="utf-8") as f:
+                    cached_sess = json.load(f)
+                age = time.time() - cached_sess.get("created_at", 0)
+                jwt_tok = cached_sess.get("jwtToken")
+                if jwt_tok and age < 14 * 3600:
+                    from SmartApi import SmartConnect
+
+                    self.client = SmartConnect(api_key=self.api_key)
+                    self._patch_client_session()
+                    self.client.setAccessToken(jwt_tok)
+                    if cached_sess.get("refreshToken"):
+                        self.client.setRefreshToken(cached_sess["refreshToken"])
+                    if cached_sess.get("feedToken"):
+                        self.client.setFeedToken(cached_sess["feedToken"])
+                    self.client.setUserId(cached_sess.get("clientcode", self.client_id))
+                    self.authenticated = True
+                    logger.info("Reusing cached Angel One session token (age: %.1f min).", age / 60)
+                    return True
+            except Exception as e:
+                logger.warning("Error loading cached session: %s. Proceeding with TOTP login.", e)
 
         try:
             import pyotp
             from SmartApi import SmartConnect
 
             self.client = SmartConnect(api_key=self.api_key)
-
-            # Instance-level patch: Ensure standard capitalized Content-Type header
-            # to resolve Cloudflare WAF / Kong 403 error without modifying library files in .venv
-            orig_rh = self.client.requestHeaders
-
-            def _patched_request_headers():
-                h = orig_rh()
-                h["Content-Type"] = "application/json"
-                return h
-
-            self.client.requestHeaders = _patched_request_headers
+            self._patch_client_session()
 
             totp = pyotp.TOTP(self.totp_secret).now()
             session = self.client.generateSession(self.client_id, self.mpin, totp)
 
             if session.get("status"):
                 self.authenticated = True
-                logger.info("Successfully authenticated with Angel One SmartAPI.")
+                data = session.get("data") or {}
+                # Cache session token
+                try:
+                    self.session_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(self.session_cache_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "jwtToken": self.client.access_token
+                                or data.get("jwtToken", "").replace("Bearer ", ""),
+                                "refreshToken": self.client.refresh_token or data.get("refreshToken"),
+                                "feedToken": self.client.feed_token or data.get("feedToken"),
+                                "clientcode": self.client.userId or self.client_id,
+                                "created_at": time.time(),
+                            },
+                            f,
+                            indent=2,
+                        )
+                except Exception as se:
+                    logger.warning("Could not persist session cache: %s", se)
+
+                logger.info("Successfully authenticated with Angel One SmartAPI and saved session cache.")
                 return True
             else:
                 msg = f"Angel One authentication rejected: {session.get('message')}"
@@ -206,13 +309,13 @@ class AngelOneProvider(BaseDataProvider):
             chunk_days = 365
         elif timeframe in ["15m", "15min"]:
             interval = "FIFTEEN_MINUTE"
-            chunk_days = self.cfg.get("data.provider.rate_limits.intraday_chunk_days", 30)
+            chunk_days = 60
         elif timeframe in ["5m", "5min"]:
             interval = "FIVE_MINUTE"
-            chunk_days = 10
+            chunk_days = 30
         elif timeframe in ["1m", "1min"]:
             interval = "ONE_MINUTE"
-            chunk_days = 5
+            chunk_days = 20
         else:
             raise ValueError(f"Unsupported timeframe: {timeframe}")
 

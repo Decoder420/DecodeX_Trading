@@ -1,14 +1,14 @@
-"""Multi-Timeframe Scalping & Intraday Trading Cockpit for Indian Index Derivatives.
+"""DecodeX Trading — Multi-Timeframe High-Frequency Quantitative Execution Terminal.
 
 Features:
-- Live Angel One SmartAPI Mode 3 WebSocket feed & options chain microstructure
-- Dynamic multi-timeframe switching (1m, 3m, 5m, 15m, 1H) with multi-day historical backfill (375–1,875 bars)
+- Live Angel One SmartAPI Mode 3 FULL_SNAP WebSocket feed & options chain microstructure
+- Dynamic multi-timeframe switching (1m, 3m, 5m, 15m, 1H) with multi-day historical backfill
 - 6-Factor Confluence Signal Engine: Intraday EMA Ribbon (9/21/50/200), Supertrend(10,2.5),
   Session Anchored VWAP + Bands, RSI(14) + MACD Momentum, Volatility Squeeze & ADX Chop Gate,
-  and Level-2 Order Flow Microstructure (Bid/Ask Imratio)
+  and Level-2 Order Flow Microstructure (Bid/Ask Imbalance)
 - Capital Protection & Profit-Locking: 3-Stage Breakeven Lock & Runner Trail
 - Small-Account Guardrails: Account Risk vs Structural ATR SL Mismatch Detection
-- Institutional 2-Pane Multi-Indicator TradingView Superchart (Height=760px)
+- Institutional 2-Pane Multi-Indicator TradingView Superchart
 - Historical Backtest Win-Rate & Profit Factor Telemetry
 """
 
@@ -54,7 +54,7 @@ from signals.macro_sentiment import shared_macro_engine
 from data.paper_trading import log_and_evaluate_signal
 
 st.set_page_config(
-    page_title="Vedic & Quant Horizon | Scalping & Intraday Trading Cockpit",
+    page_title="DecodeX Trading | Institutional Multi-Timeframe Quant Terminal",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -497,7 +497,7 @@ if should_alert:
 
 # Main Navigation Tabs
 tab_cockpit, tab_models, tab_risk, tab_feed = st.tabs([
-    "🎯 Scalping & Intraday Cockpit",
+    "🎯 Scalping & Intraday Terminal",
     "📊 Part 2 Audited Model Results",
     "📐 Dynamic Position Sizer",
     "🔌 Data Feed & API Telemetry",
@@ -1007,7 +1007,7 @@ with tab_cockpit:
         # SUB-TAB 2: LIVE OPTIONS CHAIN & FULL GREEKS COCKPIT
         # -------------------------------------------------------------
         with cockpit_tab2:
-            st.subheader(f"⚡ Live Options Chain & Greeks Cockpit — {instrument} ({active_expiry})")
+            st.subheader(f"⚡ Live Options Chain & Greeks Terminal — {instrument} ({active_expiry})")
             
             # Feed Type and Live Telemetry Transparency Status Banner
             f_type = chain_now.get("feed_type", "Live NFO Exchange Feed")

@@ -361,7 +361,7 @@ class MacroSentimentEngine:
             url,
             headers={
                 "x-api-key": api_key,
-                "User-Agent": "Mozilla/5.0 (VedicQuantCockpit/2.0)"
+                "User-Agent": "Mozilla/5.0 (DecodeXTrading/1.0)"
             }
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -510,7 +510,7 @@ class MacroSentimentEngine:
         }
 
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (VedicQuantCockpit/2.0)"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (DecodeXTrading/1.0)"})
             with urllib.request.urlopen(req, timeout=4) as resp:
                 xml_data = resp.read()
 

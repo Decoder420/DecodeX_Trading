@@ -19,3 +19,7 @@ pyotp>=2.9.0
 growwapi>=1.5.0
 smartapi-python==1.5.5
 plotly>=5.20.0
+PyQt6>=6.7.0
+pyqtgraph>=0.13.3
+PyOpenGL>=3.1.7
+redis>=5.0.0

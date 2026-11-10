@@ -1,4 +1,4 @@
-"""Live Options Chain & Greeks Cockpit Provider.
+"""Live Options Chain & Greeks DecodeX Trading Provider.
 
 Resolves active contracts, merges Open Interest with Delta, Gamma, Theta, Vega,
 and computes institutional options microstructure metrics (PCR, Max Pain, GEX).

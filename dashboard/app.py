@@ -53,9 +53,12 @@ from dashboard.options_chain import get_available_expiries, load_options_chain_d
 from signals.macro_sentiment import shared_macro_engine
 from data.paper_trading import log_and_evaluate_signal
 
+icon_file = ROOT_DIR / "assets" / "decodex_icon.png"
+logo_file = ROOT_DIR / "assets" / "decodex_logo_full.png"
+
 st.set_page_config(
     page_title="DecodeX Trading | Institutional Multi-Timeframe Quant Terminal",
-    page_icon="⚡",
+    page_icon=str(icon_file) if icon_file.exists() else "⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )

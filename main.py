@@ -53,14 +53,10 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLCDNumber,
     QMainWindow,
-    QProgressBar,
-    QPushButton,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -75,8 +71,43 @@ try:
     pg.setConfigOptions(useOpenGL=True, antialias=True)
 except Exception:
     pg.setConfigOptions(useOpenGL=False, antialias=True)
-pg.setConfigOption("background", "#0B0E14")
-pg.setConfigOption("foreground", "#E2E8F0")
+pg.setConfigOption("background", "#1E222D")
+pg.setConfigOption("foreground", "#787B86")
+
+
+# =============================================================================
+# FORMATTING UTILITIES FOR INSTITUTIONAL TELEMETRY
+# =============================================================================
+
+def format_oi(val: Any) -> str:
+    """Format Open Interest / COI deltas with clean institutional abbreviations (e.g. +48k, -120k)."""
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return str(val)
+    abs_v = abs(v)
+    sign = "+" if v > 0 else ("-" if v < 0 else "")
+    if abs_v >= 1_000_000:
+        return f"{sign}{abs_v / 1_000_000:.1f}M"
+    elif abs_v >= 1_000:
+        return f"{sign}{abs_v / 1_000:.0f}k"
+    else:
+        return f"{v:+.0f}" if v != 0 else "0"
+
+
+def format_qty(val: Any) -> str:
+    """Format quantities cleanly without overflowing table cells."""
+    try:
+        v = float(val)
+    except (ValueError, TypeError):
+        return str(val)
+    abs_v = abs(v)
+    if abs_v >= 1_000_000:
+        return f"{abs_v / 1_000_000:.1f}M"
+    elif abs_v >= 10_000:
+        return f"{abs_v / 1_000:.0f}k"
+    else:
+        return f"{int(v):,}"
 
 
 # =============================================================================
@@ -103,16 +134,17 @@ class CandlestickItem(pg.GraphicsObject):
         self.update()
 
     def _generate_picture(self) -> None:
-        """Pre-record painting commands into a fast QPicture cache."""
+        """Pre-record painting commands into a fast QPicture cache with TradingView dark aesthetics."""
         self.picture = QtGui.QPicture()
         painter = QtGui.QPainter(self.picture)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
 
-        w = 0.35  # Candle bar half-width
-        green_pen = QPen(QColor("#00E676"), 1.2)
-        green_brush = QBrush(QColor("#00E676"))
-        red_pen = QPen(QColor("#FF5252"), 1.2)
-        red_brush = QBrush(QColor("#FF5252"))
+        w = 0.36  # Candle bar half-width
+        # TradingView Standard Color Palette
+        green_pen = QPen(QColor("#089981"), 1.2)
+        green_brush = QBrush(QColor("#089981"))
+        red_pen = QPen(QColor("#F23645"), 1.2)
+        red_brush = QBrush(QColor("#F23645"))
 
         for (t, o, c, l, h) in self.data:
             if c >= o:
@@ -128,7 +160,7 @@ class CandlestickItem(pg.GraphicsObject):
             # Draw Real Body
             body_top = max(o, c)
             body_bottom = min(o, c)
-            body_h = max(0.5, body_top - body_bottom)
+            body_h = max(0.4, body_top - body_bottom)
             painter.drawRect(QtCore.QRectF(t - w, body_bottom, w * 2.0, body_h))
 
         painter.end()
@@ -152,19 +184,23 @@ class DecodeXMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # Critical Naming Directive
+        # Critical Naming Directive & Window Icon
         self.setWindowTitle("DecodeX Trading — Institutional Multi-Timeframe Quant Terminal")
+        icon_path = str(PROJECT_ROOT / "assets" / "decodex_icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QtGui.QIcon(icon_path))
+
         self.resize(1720, 1020)
         self.setMinimumSize(1280, 800)
 
         # State Variables
         self.current_instrument = "NIFTY"
         self.current_expiry = "17NOV2026"
-        self.spot_price = 24864.0
+        self.spot_price = 25044.65
         self.current_obi = 0.0
 
         # Build UI Architecture
-        self._setup_cyber_theme()
+        self._setup_institutional_theme()
         self._build_ui_layout()
 
         # Launch Isolated Background Worker Thread
@@ -176,82 +212,125 @@ class DecodeXMainWindow(QMainWindow):
         self.worker.start()
 
     # =========================================================================
-    # CYBERPUNK INSTITUTIONAL DARK THEME (macOS / Retina Optimized)
+    # INSTITUTIONAL TRADINGVIEW DARK THEME (macOS / Retina Optimized)
     # =========================================================================
 
-    def _setup_cyber_theme(self) -> None:
-        """Apply modern, high-contrast institutional dark styling."""
+    def _setup_institutional_theme(self) -> None:
+        """Apply modern TradingView Dark Mode institutional QSS styling."""
         qss = """
         QMainWindow {
-            background-color: #07090E;
+            background-color: #131722;
         }
         QWidget {
-            color: #E2E8F0;
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, Helvetica;
+            color: #D1D4DC;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
             font-size: 13px;
         }
         QFrame#card {
-            background-color: #0F131C;
-            border: 1px solid #1E293B;
+            background-color: #1E222D;
+            border: 1px solid #2A2E39;
             border-radius: 8px;
+            padding: 6px;
         }
         QFrame#highlight_card {
-            background-color: #131926;
-            border: 1px solid #334155;
+            background-color: #1E222D;
+            border: 1px solid #363A45;
             border-radius: 8px;
+            padding: 8px;
         }
         QLabel#title {
-            font-size: 17px;
+            font-size: 18px;
             font-weight: 700;
-            color: #00E676;
+            color: #F8FAFC;
             letter-spacing: 0.5px;
         }
         QLabel#subtitle {
             font-size: 11px;
-            color: #94A3B8;
+            color: #787B86;
+            font-weight: 500;
         }
         QLabel#metric_val {
-            font-size: 20px;
-            font-weight: 700;
+            font-family: "SF Mono", "Menlo", "Consolas", monospace;
+            font-size: 22px;
+            font-weight: 800;
             color: #F8FAFC;
+            letter-spacing: -0.5px;
         }
         QLabel#status_badge {
-            background-color: rgba(0, 230, 118, 0.12);
-            border: 1px solid #00E676;
-            color: #00E676;
+            background-color: rgba(8, 153, 129, 0.15);
+            border: 1px solid #089981;
+            color: #089981;
             border-radius: 12px;
-            padding: 4px 10px;
+            padding: 4px 12px;
             font-size: 11px;
             font-weight: 700;
         }
         QComboBox {
-            background-color: #1E293B;
-            border: 1px solid #334155;
+            background-color: #2A2E39;
+            border: 1px solid #363A45;
             border-radius: 6px;
             padding: 4px 10px;
             color: #F8FAFC;
             font-weight: 600;
-        }
-        QTableWidget {
-            background-color: #0B0E14;
-            border: 1px solid #1E293B;
-            gridline-color: #1E293B;
-            color: #E2E8F0;
-            border-radius: 6px;
             font-size: 12px;
         }
-        QHeaderView::section {
-            background-color: #151A23;
-            color: #94A3B8;
-            font-weight: 700;
-            border: 1px solid #1E293B;
+        QComboBox::drop-down {
+            border: none;
+            padding-right: 6px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #1E222D;
+            border: 1px solid #363A45;
+            selection-background-color: #2A2E39;
+            selection-color: #2962FF;
+            color: #D1D4DC;
             padding: 4px;
         }
-        QLCDNumber {
-            background-color: #0B0E14;
-            border: 1px solid #1E293B;
+        QTableWidget {
+            background-color: #1E222D;
+            border: none;
             border-radius: 6px;
-            color: #00E676;
+            gridline-color: transparent;
+            font-family: "SF Mono", "Menlo", "Consolas", monospace;
+            font-size: 11px;
+            color: #D1D4DC;
+        }
+        QTableWidget::item {
+            border-bottom: 1px solid #2A2E39;
+            border-top: none;
+            border-left: none;
+            border-right: none;
+            padding: 2px 4px;
+        }
+        QTableWidget::item:selected {
+            background-color: #2A2E39;
+        }
+        QHeaderView::section {
+            background-color: #2A2E39;
+            color: #787B86;
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif;
+            font-weight: 700;
+            font-size: 10px;
+            border: none;
+            border-bottom: 1px solid #363A45;
+            padding: 4px 4px;
+            text-transform: uppercase;
+        }
+        QScrollBar:vertical {
+            background-color: #1E222D;
+            width: 6px;
+            margin: 0;
+        }
+        QScrollBar::handle:vertical {
+            background-color: #2A2E39;
+            border-radius: 3px;
+            min-height: 20px;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QSplitter::handle {
+            background-color: #131722;
         }
         """
         self.setStyleSheet(qss)
@@ -261,19 +340,19 @@ class DecodeXMainWindow(QMainWindow):
     # =========================================================================
 
     def _build_ui_layout(self) -> None:
-        """Compose split-pane layout with PyQtGraph charts and telemetry panels."""
+        """Compose split-pane layout with PyQtGraph charts (70%) and telemetry panels (30%)."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(8)
 
         # 1. Top Header Bar
         main_layout.addWidget(self._build_header_bar())
 
-        # 2. Main Work Area (Splitter: Charts on Left 68%, Telemetry on Right 32%)
+        # 2. Main Work Area (Splitter: Charts on Left 70%, Telemetry on Right 30%)
         work_splitter = QSplitter(Qt.Orientation.Horizontal)
-        work_splitter.setHandleWidth(4)
+        work_splitter.setHandleWidth(5)
 
         # Left: Vertical Chart Splitter (15m Top Chart + 3m Bottom Chart + RSI)
         chart_container = QWidget()
@@ -282,7 +361,7 @@ class DecodeXMainWindow(QMainWindow):
         chart_layout.setSpacing(6)
 
         self.chart_splitter = QSplitter(Qt.Orientation.Vertical)
-        self.chart_splitter.setHandleWidth(4)
+        self.chart_splitter.setHandleWidth(5)
 
         # Setup Top 15m Structural Chart
         self.plot_15m = self._create_plot_widget(
@@ -291,7 +370,7 @@ class DecodeXMainWindow(QMainWindow):
         self.candle_item_15m = CandlestickItem()
         self.plot_15m.addItem(self.candle_item_15m)
         self.vwap_curve_15m = self.plot_15m.plot(pen=pg.mkPen(color="#00E5FF", width=2.0, name="Anchored VWAP"))
-        self.supertrend_curve_15m = self.plot_15m.plot(pen=pg.mkPen(color="#00E676", width=1.5, name="Supertrend (10, 2.5)"))
+        self.supertrend_curve_15m = self.plot_15m.plot(pen=pg.mkPen(color="#089981", width=1.6, name="Supertrend (10, 2.5)"))
         self.chart_splitter.addWidget(self.plot_15m)
 
         # Setup Bottom 3m Execution Chart
@@ -300,24 +379,44 @@ class DecodeXMainWindow(QMainWindow):
         )
         self.candle_item_3m = CandlestickItem()
         self.plot_3m.addItem(self.candle_item_3m)
-        self.ema9_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#FFD700", width=1.4, name="EMA 9"))
-        self.ema21_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#FF9100", width=1.4, name="EMA 21"))
-        self.ema50_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#B388FF", width=1.4, name="EMA 50"))
+        self.ema9_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#F59E0B", width=1.5, name="EMA 9"))
+        self.ema21_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#FF6D00", width=1.5, name="EMA 21"))
+        self.ema50_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#AB47BC", width=1.5, name="EMA 50"))
         self.chart_splitter.addWidget(self.plot_3m)
 
         # Setup Sub-Dock: 3m RSI (14) Momentum
         self.plot_rsi = pg.PlotWidget()
-        self.plot_rsi.showGrid(x=True, y=True, alpha=0.18)
-        self.plot_rsi.setMaximumHeight(130)
-        self.plot_rsi.setTitle("RSI (14) Momentum & Divergence", color="#94A3B8", size="10pt")
-        self.plot_rsi.addLine(y=70, pen=pg.mkPen(color="#FF5252", width=1, style=Qt.PenStyle.DashLine))
-        self.plot_rsi.addLine(y=50, pen=pg.mkPen(color="#64748B", width=1, style=Qt.PenStyle.DotLine))
-        self.plot_rsi.addLine(y=30, pen=pg.mkPen(color="#00E676", width=1, style=Qt.PenStyle.DashLine))
-        self.rsi_curve = self.plot_rsi.plot(pen=pg.mkPen(color="#38BDF8", width=1.5))
+        self.plot_rsi.setBackground("#1E222D")
+        self.plot_rsi.getViewBox().setBorder(pg.mkPen(color="#2A2E39", width=1))
+        self.plot_rsi.showAxis("top", False)
+        self.plot_rsi.showAxis("right", False)
+        self.plot_rsi.showGrid(x=True, y=True, alpha=0.30)
+        self.plot_rsi.setMaximumHeight(120)
+        self.plot_rsi.setTitle(
+            "<span style='color: #787B86; font-weight: 600; font-size: 10px; font-family: -apple-system, sans-serif;'>"
+            "RSI (14) MOMENTUM OSCILLATOR</span>"
+        )
+
+        b_axis = self.plot_rsi.getAxis("bottom")
+        b_axis.setPen(pg.mkPen(color="#2A2E39", width=1))
+        b_axis.setTextPen(pg.mkPen(color="#787B86"))
+        b_axis.setStyle(tickFont=QFont("SF Mono", 8))
+        b_axis.enableAutoSIPrefix(False)
+
+        l_axis = self.plot_rsi.getAxis("left")
+        l_axis.setPen(pg.mkPen(color="#2A2E39", width=1))
+        l_axis.setTextPen(pg.mkPen(color="#787B86"))
+        l_axis.setStyle(tickFont=QFont("SF Mono", 8))
+        l_axis.enableAutoSIPrefix(False)
+
+        self.plot_rsi.addLine(y=70, pen=pg.mkPen(color="#F23645", width=1, style=Qt.PenStyle.DashLine))
+        self.plot_rsi.addLine(y=50, pen=pg.mkPen(color="#475569", width=1, style=Qt.PenStyle.DotLine))
+        self.plot_rsi.addLine(y=30, pen=pg.mkPen(color="#089981", width=1, style=Qt.PenStyle.DashLine))
+        self.rsi_curve = self.plot_rsi.plot(pen=pg.mkPen(color="#2962FF", width=1.6))
         self.chart_splitter.addWidget(self.plot_rsi)
 
-        # Link X axes for synchronized panning
-        self.plot_3m.setXLink(self.plot_15m)
+        # Link RSI X-axis to 3m Execution chart (shares identical 3m bar sequence)
+        self.plot_rsi.setXLink(self.plot_3m)
 
         chart_layout.addWidget(self.chart_splitter)
         work_splitter.addWidget(chart_container)
@@ -325,64 +424,116 @@ class DecodeXMainWindow(QMainWindow):
         # Right: Institutional Telemetry Panel (L2 Depth, Confluence, Options Grid)
         work_splitter.addWidget(self._build_telemetry_panel())
 
-        # Set splitter balance: 65% Chart, 35% Panel
-        work_splitter.setStretchFactor(0, 65)
-        work_splitter.setStretchFactor(1, 35)
+        # Set splitter balance: 70% Charts, 30% Panels
+        work_splitter.setStretchFactor(0, 70)
+        work_splitter.setStretchFactor(1, 30)
+
+        # Vertical chart proportions: 48% 15m, 38% 3m, 14% RSI
+        self.chart_splitter.setStretchFactor(0, 48)
+        self.chart_splitter.setStretchFactor(1, 38)
+        self.chart_splitter.setStretchFactor(2, 14)
 
         main_layout.addWidget(work_splitter)
 
     def _create_plot_widget(self, title: str) -> pg.PlotWidget:
-        """Create a styled PyQtGraph PlotWidget with date-time grid lines."""
+        """Create a styled PyQtGraph PlotWidget matching TradingView Dark aesthetics."""
         plot = pg.PlotWidget()
-        plot.setTitle(title, color="#E2E8F0", size="11pt")
-        plot.showGrid(x=True, y=True, alpha=0.15)
-        plot.addLegend(offset=(10, 10))
-        plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+        plot.setBackground("#1E222D")
+        plot.setTitle(
+            f"<span style='color: #D1D4DC; font-weight: 600; font-size: 11px; font-family: -apple-system, sans-serif;'>"
+            f"{title}</span>"
+        )
+        plot.getViewBox().setBorder(pg.mkPen(color="#2A2E39", width=1))
+
+        # Hide top and right bounding box axes
+        plot.showAxis("top", False)
+        plot.showAxis("right", False)
+
+        # Style left and bottom axes
+        axis_pen = pg.mkPen(color="#2A2E39", width=1)
+        text_pen = pg.mkPen(color="#787B86")
+        font = QFont("SF Mono", 9)
+
+        b_axis = plot.getAxis("bottom")
+        b_axis.setPen(axis_pen)
+        b_axis.setTextPen(text_pen)
+        b_axis.setStyle(tickFont=font)
+        b_axis.enableAutoSIPrefix(False)
+
+        l_axis = plot.getAxis("left")
+        l_axis.setPen(axis_pen)
+        l_axis.setTextPen(text_pen)
+        l_axis.setStyle(tickFont=font)
+        l_axis.enableAutoSIPrefix(False)
+
+        # Faint dashed grid lines (#2A2E39)
+        plot.showGrid(x=True, y=True, alpha=0.30)
+
+        # Minimal dark legend
+        legend = plot.addLegend(offset=(12, 10), labelTextColor="#94A3B8")
+        legend.setBrush(pg.mkBrush(30, 34, 45, 190))
+        legend.setPen(pg.mkPen("#2A2E39"))
+
         return plot
 
     # =========================================================================
-    # HEADER BAR & CONTROLS
+    # HEADER BAR & BRANDING
     # =========================================================================
 
     def _build_header_bar(self) -> QWidget:
         header = QFrame()
         header.setObjectName("card")
         layout = QHBoxLayout(header)
-        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setContentsMargins(14, 6, 14, 6)
+        layout.setSpacing(14)
 
-        # DecodeX Branding
-        brand_lbl = QLabel("⚡ DecodeX Trading")
-        brand_lbl.setObjectName("title")
-        sub_lbl = QLabel("Institutional Multi-Timeframe Quant Terminal")
-        sub_lbl.setObjectName("subtitle")
-        brand_box = QVBoxLayout()
-        brand_box.addWidget(brand_lbl)
-        brand_box.addWidget(sub_lbl)
-        layout.addLayout(brand_box)
+        # DecodeX Official Logo
+        logo_path = str(PROJECT_ROOT / "assets" / "decodex_logo_full.png")
+        if os.path.exists(logo_path):
+            logo_pix = QtGui.QPixmap(logo_path)
+            if not logo_pix.isNull():
+                scaled_logo = logo_pix.scaledToHeight(36, Qt.TransformationMode.SmoothTransformation)
+                logo_lbl = QLabel()
+                logo_lbl.setPixmap(scaled_logo)
+                logo_lbl.setFixedHeight(36)
+                layout.addWidget(logo_lbl)
+            else:
+                self._add_fallback_brand(layout)
+        else:
+            self._add_fallback_brand(layout)
 
-        layout.addSpacing(20)
+        layout.addSpacing(10)
 
         # Instrument Selector
-        layout.addWidget(QLabel("Instrument:"))
+        inst_box = QHBoxLayout()
+        inst_lbl = QLabel("Instrument:")
+        inst_lbl.setStyleSheet("color: #787B86; font-size: 11px; font-weight: 600;")
         self.inst_combo = QComboBox()
         self.inst_combo.addItems(["NIFTY", "BANKNIFTY", "SENSEX"])
         self.inst_combo.setCurrentText(self.current_instrument)
         self.inst_combo.currentTextChanged.connect(self._on_instrument_changed)
-        layout.addWidget(self.inst_combo)
+        inst_box.addWidget(inst_lbl)
+        inst_box.addWidget(self.inst_combo)
+        layout.addLayout(inst_box)
 
         # Expiry Selector
-        layout.addWidget(QLabel("Expiry:"))
+        exp_box = QHBoxLayout()
+        exp_lbl = QLabel("Expiry:")
+        exp_lbl.setStyleSheet("color: #787B86; font-size: 11px; font-weight: 600;")
         self.expiry_combo = QComboBox()
         self.expiry_combo.addItems(["17NOV2026 (Near Weekly)", "24NOV2026 (Next Weekly)", "26NOV2026 (Monthly)"])
-        layout.addWidget(self.expiry_combo)
+        exp_box.addWidget(exp_lbl)
+        exp_box.addWidget(self.expiry_combo)
+        layout.addLayout(exp_box)
 
-        layout.addSpacing(20)
+        layout.addSpacing(16)
 
         # Live Spot Price Widget
         spot_box = QVBoxLayout()
+        spot_box.setSpacing(1)
         self.spot_title_lbl = QLabel(f"{self.current_instrument} SPOT LTP")
-        self.spot_title_lbl.setStyleSheet("font-size: 10px; color: #94A3B8; font-weight: 600;")
-        self.spot_price_lbl = QLabel("₹24,864.10")
+        self.spot_title_lbl.setStyleSheet("font-size: 10px; color: #787B86; font-weight: 700; letter-spacing: 0.5px;")
+        self.spot_price_lbl = QLabel(f"₹{self.spot_price:,.2f}")
         self.spot_price_lbl.setObjectName("metric_val")
         spot_box.addWidget(self.spot_title_lbl)
         spot_box.addWidget(self.spot_price_lbl)
@@ -391,11 +542,21 @@ class DecodeXMainWindow(QMainWindow):
         layout.addStretch()
 
         # Connection Status Badge
-        self.conn_badge = QLabel("🟢 Connected (Mode 3 FULL_SNAP)")
+        self.conn_badge = QLabel("🟢 Connected (Mode 3 FULL_SNAP Active | Tokens: 23)")
         self.conn_badge.setObjectName("status_badge")
         layout.addWidget(self.conn_badge)
 
         return header
+
+    def _add_fallback_brand(self, layout: QHBoxLayout) -> None:
+        brand_lbl = QLabel("⚡ DecodeX Trading")
+        brand_lbl.setObjectName("title")
+        sub_lbl = QLabel("Institutional Quant Terminal")
+        sub_lbl.setObjectName("subtitle")
+        brand_box = QVBoxLayout()
+        brand_box.addWidget(brand_lbl)
+        brand_box.addWidget(sub_lbl)
+        layout.addLayout(brand_box)
 
     # =========================================================================
     # RIGHT TELEMETRY PANEL (DEPTH + CONFLUENCE + OPTIONS CHAIN)
@@ -405,7 +566,7 @@ class DecodeXMainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
         # 1. MTF 6-Factor Confluence Card
         layout.addWidget(self._build_confluence_card())
@@ -422,41 +583,42 @@ class DecodeXMainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("highlight_card")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
 
         # Header
         h_layout = QHBoxLayout()
         title = QLabel("🎯 6-Factor MTF Confluence Gate")
-        title.setStyleSheet("font-weight: 700; color: #F8FAFC;")
+        title.setStyleSheet("font-weight: 700; color: #F8FAFC; font-size: 12px; letter-spacing: 0.3px;")
         self.score_badge = QLabel("Score: +4.80")
-        self.score_badge.setStyleSheet("font-weight: 700; color: #00E676; font-size: 12px;")
+        self.score_badge.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 700; color: #089981; font-size: 12px;')
         h_layout.addWidget(title)
         h_layout.addStretch()
         h_layout.addWidget(self.score_badge)
         layout.addLayout(h_layout)
 
         # Status Banner
-        self.confluence_banner = QLabel("CONFLUENCE WAIT (CHOP / SQUEEZE FILTER)")
+        self.confluence_banner = QLabel("⚪ CONFLUENCE WAIT (CHOP / SQUEEZE FILTER)")
         self.confluence_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.confluence_banner.setStyleSheet(
-            "background-color: rgba(148, 163, 184, 0.15); border: 1px solid #475569; "
-            "color: #CBD5E1; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
+            "background-color: rgba(42, 46, 57, 0.6); border: 1px solid #363A45; "
+            "color: #D1D4DC; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
         )
         layout.addWidget(self.confluence_banner)
 
         # MTF Badges Grid
         badges_layout = QHBoxLayout()
         self.badge_15m = QLabel("15m Bias: BULLISH")
-        self.badge_15m.setStyleSheet("background: rgba(0, 230, 118, 0.15); color: #00E676; font-weight: 700; padding: 3px 6px; border-radius: 4px;")
+        self.badge_15m.setStyleSheet("background: rgba(8, 153, 129, 0.15); color: #089981; font-weight: 700; padding: 3px 8px; border-radius: 4px; font-size: 11px;")
         self.badge_3m = QLabel("3m Trigger: LONG")
-        self.badge_3m.setStyleSheet("background: rgba(0, 230, 118, 0.15); color: #00E676; font-weight: 700; padding: 3px 6px; border-radius: 4px;")
+        self.badge_3m.setStyleSheet("background: rgba(8, 153, 129, 0.15); color: #089981; font-weight: 700; padding: 3px 8px; border-radius: 4px; font-size: 11px;")
         badges_layout.addWidget(self.badge_15m)
         badges_layout.addWidget(self.badge_3m)
         layout.addLayout(badges_layout)
 
         # Suggested Trade Plan
-        self.trade_plan_lbl = QLabel("Suggested: 24850 CE | Entry: ₹24,864 | SL: ₹24,815 | Target: ₹24,960")
-        self.trade_plan_lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 500;")
+        self.trade_plan_lbl = QLabel("Plan: Entry: ₹25,044.7 | SL: ₹24,978.0 | Target: ₹25,133.5 | R:R: 1:2.3")
+        self.trade_plan_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-size: 11px; color: #94A3B8; font-weight: 500;')
         layout.addWidget(self.trade_plan_lbl)
 
         return card
@@ -465,31 +627,35 @@ class DecodeXMainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("card")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
 
         # Header with OBI Readout
         h_layout = QHBoxLayout()
         title = QLabel("⚡ True L2 Depth & Microstructure")
-        title.setStyleSheet("font-weight: 700; color: #F8FAFC;")
+        title.setStyleSheet("font-weight: 700; color: #F8FAFC; font-size: 12px; letter-spacing: 0.3px;")
         h_layout.addWidget(title)
         h_layout.addStretch()
 
-        self.obi_lbl = QLabel("OBI: +0.28 (Buyers)")
-        self.obi_lbl.setStyleSheet("font-weight: 800; color: #00E676; font-size: 13px;")
+        self.obi_lbl = QLabel("OBI: +0.28 (Heavy Buying)")
+        self.obi_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 800; color: #089981; font-size: 12px;')
         h_layout.addWidget(self.obi_lbl)
         layout.addLayout(h_layout)
 
         # 5-Level Depth Table
         self.depth_table = QTableWidget(5, 6)
-        self.depth_table.setHorizontalHeaderLabels(["Bid Orders", "Bid Qty", "Bid Price", "Ask Price", "Ask Qty", "Ask Orders"])
+        self.depth_table.setHorizontalHeaderLabels(["BID ORDERS", "BID QTY", "BID PRICE", "ASK PRICE", "ASK QTY", "ASK ORDERS"])
+        self.depth_table.setShowGrid(False)
         self.depth_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.depth_table.verticalHeader().setVisible(False)
-        self.depth_table.setMaximumHeight(150)
+        self.depth_table.verticalHeader().setDefaultSectionSize(22)
+        self.depth_table.horizontalHeader().setFixedHeight(24)
+        self.depth_table.setFixedHeight(138)
         layout.addWidget(self.depth_table)
 
         # Micro-price & Spread Footer
-        self.spread_lbl = QLabel("Top Spread: 0.85 pts | Micro-Price: ₹24,864.40")
-        self.spread_lbl.setStyleSheet("font-size: 11px; color: #64748B;")
+        self.spread_lbl = QLabel("Top Spread: 0.50 pts | Micro-Price: ₹25,044.80")
+        self.spread_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-size: 11px; color: #787B86;')
         layout.addWidget(self.spread_lbl)
 
         return card
@@ -498,14 +664,15 @@ class DecodeXMainWindow(QMainWindow):
         card = QFrame()
         card.setObjectName("card")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
 
         # Header
         h_layout = QHBoxLayout()
         title = QLabel("📊 Options Chain Grid (ATM ± 200)")
-        title.setStyleSheet("font-weight: 700; color: #F8FAFC;")
-        self.coi_delta_lbl = QLabel("Triad COI Δ: +48.5k (Bullish)")
-        self.coi_delta_lbl.setStyleSheet("font-weight: 700; color: #00E676; font-size: 12px;")
+        title.setStyleSheet("font-weight: 700; color: #F8FAFC; font-size: 12px; letter-spacing: 0.3px;")
+        self.coi_delta_lbl = QLabel("Triad COI Δ: +48k (Bullish)")
+        self.coi_delta_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 700; color: #089981; font-size: 12px;')
         h_layout.addWidget(title)
         h_layout.addStretch()
         h_layout.addWidget(self.coi_delta_lbl)
@@ -514,10 +681,14 @@ class DecodeXMainWindow(QMainWindow):
         # Options Table
         self.options_table = QTableWidget(5, 9)
         self.options_table.setHorizontalHeaderLabels([
-            "CE IV", "CE Δ", "CE COI Δ", "CE OI", "Strike", "PE OI", "PE COI Δ", "PE Δ", "PE IV"
+            "CE IV", "CE Δ", "CE COI", "CE OI", "STRIKE", "PE OI", "PE COI", "PE Δ", "PE IV"
         ])
+        self.options_table.setShowGrid(False)
         self.options_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.options_table.verticalHeader().setVisible(False)
+        self.options_table.verticalHeader().setDefaultSectionSize(22)
+        self.options_table.horizontalHeader().setFixedHeight(24)
+        self.options_table.setFixedHeight(138)
         layout.addWidget(self.options_table)
 
         return card
@@ -549,13 +720,13 @@ class DecodeXMainWindow(QMainWindow):
         # Update OBI label styling
         if obi > 0.15:
             self.obi_lbl.setText(f"OBI: {obi:+.2f} (Heavy Buying)")
-            self.obi_lbl.setStyleSheet("font-weight: 800; color: #00E676; font-size: 13px;")
+            self.obi_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 800; color: #089981; font-size: 12px;')
         elif obi < -0.15:
             self.obi_lbl.setText(f"OBI: {obi:+.2f} (Heavy Selling)")
-            self.obi_lbl.setStyleSheet("font-weight: 800; color: #FF5252; font-size: 13px;")
+            self.obi_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 800; color: #F23645; font-size: 12px;')
         else:
             self.obi_lbl.setText(f"OBI: {obi:+.2f} (Balanced)")
-            self.obi_lbl.setStyleSheet("font-weight: 800; color: #94A3B8; font-size: 13px;")
+            self.obi_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 800; color: #787B86; font-size: 12px;')
 
         self.spread_lbl.setText(
             f"Top Spread: {depth.get('spread', 0):.2f} pts | Micro-Price: ₹{depth.get('micro_price', 0):,.2f}"
@@ -568,18 +739,18 @@ class DecodeXMainWindow(QMainWindow):
             b = bids[i] if i < len(bids) else {}
             a = asks[i] if i < len(asks) else {}
 
-            self._set_table_item(self.depth_table, i, 0, str(b.get("orders", "—")), align=Qt.AlignmentFlag.AlignCenter)
-            self._set_table_item(self.depth_table, i, 1, f"{b.get('quantity', 0):,}", color="#00E676")
-            self._set_table_item(self.depth_table, i, 2, f"₹{b.get('price', 0):,.1f}", color="#00E676", bold=True)
+            self._set_table_item(self.depth_table, i, 0, str(b.get("orders", "—")), color="#787B86", align=Qt.AlignmentFlag.AlignCenter)
+            self._set_table_item(self.depth_table, i, 1, format_qty(b.get('quantity', 0)), color="#089981")
+            self._set_table_item(self.depth_table, i, 2, f"₹{b.get('price', 0):,.1f}", color="#089981", bold=True)
 
-            self._set_table_item(self.depth_table, i, 3, f"₹{a.get('price', 0):,.1f}", color="#FF5252", bold=True)
-            self._set_table_item(self.depth_table, i, 4, f"{a.get('quantity', 0):,}", color="#FF5252")
-            self._set_table_item(self.depth_table, i, 5, str(a.get("orders", "—")), align=Qt.AlignmentFlag.AlignCenter)
+            self._set_table_item(self.depth_table, i, 3, f"₹{a.get('price', 0):,.1f}", color="#F23645", bold=True)
+            self._set_table_item(self.depth_table, i, 4, format_qty(a.get('quantity', 0)), color="#F23645")
+            self._set_table_item(self.depth_table, i, 5, str(a.get("orders", "—")), color="#787B86", align=Qt.AlignmentFlag.AlignCenter)
 
     @pyqtSlot(dict)
     def on_mtf_updated(self, mtf_data: Dict[str, Any]) -> None:
         """Update 15m structural and 3m execution plots with indicators and confluence."""
-        # 1. Update 15m Plot
+        # 1. Update 15m Structural Frame Plot
         bars_15m = mtf_data.get("15m", {}).get("bars", [])
         if bars_15m:
             candle_data_15m = [
@@ -587,13 +758,35 @@ class DecodeXMainWindow(QMainWindow):
             ]
             self.candle_item_15m.set_data(candle_data_15m)
 
-            vwap_val = mtf_data["15m"].get("anchored_vwap", self.spot_price)
-            st_val = mtf_data["15m"].get("supertrend", self.spot_price)
-            x_arr = list(range(len(bars_15m)))
-            self.vwap_curve_15m.setData(x_arr, [vwap_val] * len(x_arr))
-            self.supertrend_curve_15m.setData(x_arr, [st_val] * len(x_arr))
+            n15 = len(bars_15m)
+            x15_arr = np.arange(n15)
 
-        # 2. Update 3m Plot
+            vwap_series = mtf_data["15m"].get("vwap_series")
+            if vwap_series and len(vwap_series) == n15:
+                self.vwap_curve_15m.setData(x15_arr, vwap_series)
+            else:
+                vwap_val = mtf_data["15m"].get("anchored_vwap", self.spot_price)
+                self.vwap_curve_15m.setData(x15_arr, [vwap_val] * n15)
+
+            st_series = mtf_data["15m"].get("supertrend_series")
+            if st_series and len(st_series) == n15:
+                self.supertrend_curve_15m.setData(x15_arr, st_series)
+            else:
+                st_val = mtf_data["15m"].get("supertrend", self.spot_price)
+                self.supertrend_curve_15m.setData(x15_arr, [st_val] * n15)
+
+            # Auto-frame 15m ViewBox
+            vis_15 = bars_15m[-min(45, n15):]
+            lows_15 = [b["low"] for b in vis_15]
+            highs_15 = [b["high"] for b in vis_15]
+            if lows_15 and highs_15:
+                y_min_15 = min(lows_15)
+                y_max_15 = max(highs_15)
+                pad_15 = max((y_max_15 - y_min_15) * 0.14, 12.0)
+                self.plot_15m.setYRange(y_min_15 - pad_15, y_max_15 + pad_15, padding=0)
+                self.plot_15m.setXRange(max(0, n15 - 50), n15 + 4, padding=0)
+
+        # 2. Update 3m Execution Frame Plot
         bars_3m = mtf_data.get("3m", {}).get("bars", [])
         if bars_3m:
             candle_data_3m = [
@@ -601,18 +794,51 @@ class DecodeXMainWindow(QMainWindow):
             ]
             self.candle_item_3m.set_data(candle_data_3m)
 
-            x3_arr = list(range(len(bars_3m)))
-            ema9 = mtf_data["3m"].get("ema_9", self.spot_price)
-            ema21 = mtf_data["3m"].get("ema_21", self.spot_price)
-            ema50 = mtf_data["3m"].get("ema_50", self.spot_price)
-            self.ema9_curve_3m.setData(x3_arr, [ema9] * len(x3_arr))
-            self.ema21_curve_3m.setData(x3_arr, [ema21] * len(x3_arr))
-            self.ema50_curve_3m.setData(x3_arr, [ema50] * len(x3_arr))
+            n3 = len(bars_3m)
+            x3_arr = np.arange(n3)
 
-            rsi_val = mtf_data["3m"].get("rsi_14", 50.0)
-            self.rsi_curve.setData(x3_arr[-30:], [rsi_val] * min(30, len(x3_arr)))
+            ema9_s = mtf_data["3m"].get("ema_9_series")
+            if ema9_s and len(ema9_s) == n3:
+                self.ema9_curve_3m.setData(x3_arr, ema9_s)
+            else:
+                ema9 = mtf_data["3m"].get("ema_9", self.spot_price)
+                self.ema9_curve_3m.setData(x3_arr, [ema9] * n3)
 
-        # 3. Update Confluence Banner & Badges
+            ema21_s = mtf_data["3m"].get("ema_21_series")
+            if ema21_s and len(ema21_s) == n3:
+                self.ema21_curve_3m.setData(x3_arr, ema21_s)
+            else:
+                ema21 = mtf_data["3m"].get("ema_21", self.spot_price)
+                self.ema21_curve_3m.setData(x3_arr, [ema21] * n3)
+
+            ema50_s = mtf_data["3m"].get("ema_50_series")
+            if ema50_s and len(ema50_s) == n3:
+                self.ema50_curve_3m.setData(x3_arr, ema50_s)
+            else:
+                ema50 = mtf_data["3m"].get("ema_50", self.spot_price)
+                self.ema50_curve_3m.setData(x3_arr, [ema50] * n3)
+
+            # Auto-frame 3m ViewBox
+            vis_3 = bars_3m[-min(55, n3):]
+            lows_3 = [b["low"] for b in vis_3]
+            highs_3 = [b["high"] for b in vis_3]
+            if lows_3 and highs_3:
+                y_min_3 = min(lows_3)
+                y_max_3 = max(highs_3)
+                pad_3 = max((y_max_3 - y_min_3) * 0.14, 12.0)
+                self.plot_3m.setYRange(y_min_3 - pad_3, y_max_3 + pad_3, padding=0)
+                self.plot_3m.setXRange(max(0, n3 - 60), n3 + 5, padding=0)
+
+            # 3. Update RSI Momentum Oscillator
+            rsi_s = mtf_data["3m"].get("rsi_series")
+            if rsi_s and len(rsi_s) == n3:
+                self.rsi_curve.setData(x3_arr, rsi_s)
+            else:
+                rsi_val = mtf_data["3m"].get("rsi_14", 50.0)
+                self.rsi_curve.setData(x3_arr, [rsi_val] * n3)
+            self.plot_rsi.setYRange(10, 90, padding=0)
+
+        # 4. Update Confluence Banner & Badges
         confl = mtf_data.get("confluence", {})
         sig = confl.get("signal", "CONFLUENCE WAIT")
         score = confl.get("score", 0.0)
@@ -621,20 +847,20 @@ class DecodeXMainWindow(QMainWindow):
         if "BULLISH" in sig:
             self.confluence_banner.setText("🟢 BULLISH ENTRY (15m + 3m Converged)")
             self.confluence_banner.setStyleSheet(
-                "background-color: rgba(0, 230, 118, 0.2); border: 1px solid #00E676; "
-                "color: #00E676; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
+                "background-color: rgba(8, 153, 129, 0.2); border: 1px solid #089981; "
+                "color: #089981; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
             )
         elif "BEARISH" in sig:
             self.confluence_banner.setText("🔴 BEARISH ENTRY (15m + 3m Converged)")
             self.confluence_banner.setStyleSheet(
-                "background-color: rgba(255, 82, 82, 0.2); border: 1px solid #FF5252; "
-                "color: #FF5252; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
+                "background-color: rgba(242, 54, 69, 0.2); border: 1px solid #F23645; "
+                "color: #F23645; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
             )
         else:
             self.confluence_banner.setText("⚪ CONFLUENCE WAIT (CHOP / SQUEEZE FILTER)")
             self.confluence_banner.setStyleSheet(
-                "background-color: rgba(148, 163, 184, 0.15); border: 1px solid #475569; "
-                "color: #CBD5E1; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
+                "background-color: rgba(42, 46, 57, 0.6); border: 1px solid #363A45; "
+                "color: #D1D4DC; font-weight: 800; font-size: 13px; border-radius: 6px; padding: 7px;"
             )
 
         # Update Timeframe Badges
@@ -648,7 +874,7 @@ class DecodeXMainWindow(QMainWindow):
         sl = confl.get("stop_loss", self.spot_price - 50)
         t1 = confl.get("target_1", self.spot_price + 80)
         self.trade_plan_lbl.setText(
-            f"Plan: Entry: ₹{entry:,.1f} | SL: ₹{sl:,.1f} | Target: ₹{t1:,.1f} | R:R: {confl.get('risk_reward', '1:2')}"
+            f"Plan: Entry: ₹{entry:,.1f} | SL: ₹{sl:,.1f} | Target: ₹{t1:,.1f} | R:R: {confl.get('risk_reward', '1:2.3')}"
         )
 
     @pyqtSlot(dict)
@@ -658,40 +884,54 @@ class DecodeXMainWindow(QMainWindow):
         net_triad = opt_data.get("net_coi_delta_triad", 0.0)
 
         if net_triad > 0:
-            self.coi_delta_lbl.setText(f"Triad COI Δ: +{net_triad:,.0f} (PE Writing / Support Floor)")
-            self.coi_delta_lbl.setStyleSheet("font-weight: 700; color: #00E676; font-size: 12px;")
+            self.coi_delta_lbl.setText(f"Triad COI Δ: {format_oi(net_triad)} (PE Writing / Support Floor)")
+            self.coi_delta_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 700; color: #089981; font-size: 11px;')
         else:
-            self.coi_delta_lbl.setText(f"Triad COI Δ: {net_triad:,.0f} (CE Writing / Resistance Wall)")
-            self.coi_delta_lbl.setStyleSheet("font-weight: 700; color: #FF5252; font-size: 12px;")
+            self.coi_delta_lbl.setText(f"Triad COI Δ: {format_oi(net_triad)} (CE Writing / Resistance Wall)")
+            self.coi_delta_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 700; color: #F23645; font-size: 11px;')
 
         for i, s in enumerate(strikes[:5]):
             # CE Side
-            self._set_table_item(self.options_table, i, 0, f"{s['ce_iv']:.1f}%")
-            self._set_table_item(self.options_table, i, 1, f"{s['ce_delta']:+.2f}")
+            self._set_table_item(self.options_table, i, 0, f"{s['ce_iv']:.1f}%", color="#94A3B8", align=Qt.AlignmentFlag.AlignCenter)
+            self._set_table_item(self.options_table, i, 1, f"{s['ce_delta']:+.2f}", color="#089981" if s["ce_delta"] >= 0 else "#F23645", align=Qt.AlignmentFlag.AlignCenter)
             self._set_table_item(
-                self.options_table, i, 2, f"{s['ce_coi']:+,}",
+                self.options_table, i, 2, format_oi(s["ce_coi"]),
                 bg_color="#3B1214" if s["heavy_ce_writing"] else None,
-                color="#FF5252" if s["heavy_ce_writing"] else "#CBD5E1"
+                color="#F23645" if s["heavy_ce_writing"] else "#CBD5E1",
+                bold=s["heavy_ce_writing"],
+                align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             )
-            self._set_table_item(self.options_table, i, 3, f"{s['ce_oi']:,}")
+            self._set_table_item(
+                self.options_table, i, 3, format_qty(s["ce_oi"]),
+                color="#D1D4DC",
+                align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            )
 
             # Strike Center
+            is_atm = s.get("is_atm", False)
             self._set_table_item(
-                self.options_table, i, 4, f"₹{s['strike']:,.0f}",
+                self.options_table, i, 4, f"{s['strike']:,.0f}",
                 bold=True,
-                bg_color="#1E293B" if s["is_atm"] else None,
-                color="#FFD700" if s["is_atm"] else "#F8FAFC"
+                bg_color="#2A2E39" if is_atm else None,
+                color="#F59E0B" if is_atm else "#F8FAFC",
+                align=Qt.AlignmentFlag.AlignCenter,
             )
 
             # PE Side
-            self._set_table_item(self.options_table, i, 5, f"{s['pe_oi']:,}")
             self._set_table_item(
-                self.options_table, i, 6, f"{s['pe_coi']:+,}",
-                bg_color="#0F2D1E" if s["heavy_pe_writing"] else None,
-                color="#00E676" if s["heavy_pe_writing"] else "#CBD5E1"
+                self.options_table, i, 5, format_qty(s["pe_oi"]),
+                color="#D1D4DC",
+                align=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             )
-            self._set_table_item(self.options_table, i, 7, f"{s['pe_delta']:+.2f}")
-            self._set_table_item(self.options_table, i, 8, f"{s['pe_iv']:.1f}%")
+            self._set_table_item(
+                self.options_table, i, 6, format_oi(s["pe_coi"]),
+                bg_color="#0F2D1E" if s["heavy_pe_writing"] else None,
+                color="#089981" if s["heavy_pe_writing"] else "#CBD5E1",
+                bold=s["heavy_pe_writing"],
+                align=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            )
+            self._set_table_item(self.options_table, i, 7, f"{s['pe_delta']:+.2f}", color="#089981" if s["pe_delta"] >= 0 else "#F23645", align=Qt.AlignmentFlag.AlignCenter)
+            self._set_table_item(self.options_table, i, 8, f"{s['pe_iv']:.1f}%", color="#94A3B8", align=Qt.AlignmentFlag.AlignCenter)
 
     @pyqtSlot(str, str)
     def on_connection_status(self, status: str, message: str) -> None:
@@ -699,20 +939,20 @@ class DecodeXMainWindow(QMainWindow):
         if status == "CONNECTED":
             self.conn_badge.setText(f"🟢 Connected ({message})")
             self.conn_badge.setStyleSheet(
-                "background-color: rgba(0, 230, 118, 0.12); border: 1px solid #00E676; "
-                "color: #00E676; border-radius: 12px; padding: 4px 10px; font-weight: 700;"
+                "background-color: rgba(8, 153, 129, 0.15); border: 1px solid #089981; "
+                "color: #089981; border-radius: 12px; padding: 4px 12px; font-weight: 700;"
             )
         elif status == "RECONNECTING":
             self.conn_badge.setText(f"🟠 {message}")
             self.conn_badge.setStyleSheet(
-                "background-color: rgba(255, 145, 0, 0.15); border: 1px solid #FF9100; "
-                "color: #FF9100; border-radius: 12px; padding: 4px 10px; font-weight: 700;"
+                "background-color: rgba(245, 158, 11, 0.15); border: 1px solid #F59E0B; "
+                "color: #F59E0B; border-radius: 12px; padding: 4px 12px; font-weight: 700;"
             )
         else:
             self.conn_badge.setText(f"🔴 {status}: {message}")
             self.conn_badge.setStyleSheet(
-                "background-color: rgba(255, 82, 82, 0.15); border: 1px solid #FF5252; "
-                "color: #FF5252; border-radius: 12px; padding: 4px 10px; font-weight: 700;"
+                "background-color: rgba(242, 54, 69, 0.15); border: 1px solid #F23645; "
+                "color: #F23645; border-radius: 12px; padding: 4px 12px; font-weight: 700;"
             )
 
     def _set_table_item(
@@ -782,6 +1022,10 @@ def main() -> None:
     app.setApplicationName("DecodeX Trading")
     app.setOrganizationName("DecodeX")
 
+    icon_path = str(PROJECT_ROOT / "assets" / "decodex_icon.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QtGui.QIcon(icon_path))
+
     window = DecodeXMainWindow()
     window.show()
 
@@ -790,4 +1034,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

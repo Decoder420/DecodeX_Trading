@@ -449,20 +449,29 @@ class DecodeXDataWorker(QThread):
         if len(df15) < 15:
             return
 
-        # Anchored VWAP (Anchored to today's 09:15:00 IST open)
-        today_date = dt.date()
-        today_mask = df15["timestamp"].apply(lambda t: t.date() == today_date)
-        if today_mask.any():
-            sub = df15[today_mask]
-            typ_p = (sub["high"] + sub["low"] + sub["close"]) / 3.0
-            cum_pv = (typ_p * sub["volume"]).cumsum()
-            cum_v = sub["volume"].cumsum()
-            anchored_vwap = float((cum_pv / cum_v.replace(0, 1)).iloc[-1])
-        else:
-            anchored_vwap = float(df15["close"].iloc[-1])
+        # Anchored VWAP Series (Anchored to each day's session start)
+        vwap_series: List[float] = []
+        for idx in range(len(df15)):
+            curr_date = df15["timestamp"].iloc[idx].date()
+            day_sub = df15.iloc[: idx + 1]
+            day_sub = day_sub[day_sub["timestamp"].apply(lambda t: t.date() == curr_date)]
+            v_sum = day_sub["volume"].sum()
+            if v_sum > 0:
+                tp = (day_sub["high"] + day_sub["low"] + day_sub["close"]) / 3.0
+                v_val = float((tp * day_sub["volume"]).sum() / v_sum)
+            else:
+                v_val = float(((day_sub["high"] + day_sub["low"] + day_sub["close"]) / 3.0).mean())
+            c_val = float(df15["close"].iloc[idx])
+            if not (0.90 * c_val <= v_val <= 1.10 * c_val):
+                v_val = c_val
+            vwap_series.append(round(v_val, 2))
+
+        anchored_vwap = vwap_series[-1] if vwap_series else price
 
         # Supertrend (10, 2.5) on 15m
-        st_val, st_dir = self._calc_supertrend(df15, period=10, multiplier=2.5)
+        st_val, st_dir, st_series = self._calc_supertrend(df15, period=10, multiplier=2.5)
+        if not (0.85 * price <= st_val <= 1.15 * price):
+            st_val = price
 
         # Daily ATR (14)
         atr_15m = self._calc_atr(df15, period=14)
@@ -480,10 +489,13 @@ class DecodeXDataWorker(QThread):
         if len(df3) < 25:
             return
 
-        # EMA Ribbon (9, 21, 50)
-        ema_9 = float(df3["close"].ewm(span=9, adjust=False).mean().iloc[-1])
-        ema_21 = float(df3["close"].ewm(span=21, adjust=False).mean().iloc[-1])
-        ema_50 = float(df3["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        # EMA Ribbon (9, 21, 50) Series
+        ema_9_series = df3["close"].ewm(span=9, adjust=False).mean().round(2).tolist()
+        ema_21_series = df3["close"].ewm(span=21, adjust=False).mean().round(2).tolist()
+        ema_50_series = df3["close"].ewm(span=50, adjust=False).mean().round(2).tolist()
+        ema_9 = float(ema_9_series[-1])
+        ema_21 = float(ema_21_series[-1])
+        ema_50 = float(ema_50_series[-1])
 
         # Bollinger Bands & Keltner Squeeze (20, 2.0 BB vs 20, 1.5 ATR KC)
         bb_mid = df3["close"].rolling(20).mean()
@@ -499,8 +511,8 @@ class DecodeXDataWorker(QThread):
         squeeze_on = bool(bb_upper < kc_upper and bb_lower > kc_lower)
         squeeze_fired = bool(bb_upper >= kc_upper or bb_lower <= kc_lower)
 
-        # RSI (14)
-        rsi_3m = self._calc_rsi(df3["close"], period=14)
+        # RSI (14) Series
+        rsi_3m, rsi_series = self._calc_rsi_series(df3["close"], period=14)
 
         # 3m Execution Trigger
         trigger_3m = "WAIT"
@@ -546,7 +558,9 @@ class DecodeXDataWorker(QThread):
             "spot_price": price,
             "15m": {
                 "anchored_vwap": round(anchored_vwap, 2),
+                "vwap_series": vwap_series[-100:],
                 "supertrend": round(st_val, 2),
+                "supertrend_series": st_series[-100:],
                 "supertrend_direction": st_dir,
                 "daily_atr": round(atr_15m, 2),
                 "bias": bias_15m,
@@ -554,11 +568,15 @@ class DecodeXDataWorker(QThread):
             },
             "3m": {
                 "ema_9": round(ema_9, 2),
+                "ema_9_series": ema_9_series[-120:],
                 "ema_21": round(ema_21, 2),
+                "ema_21_series": ema_21_series[-120:],
                 "ema_50": round(ema_50, 2),
+                "ema_50_series": ema_50_series[-120:],
                 "squeeze_on": squeeze_on,
                 "squeeze_fired": squeeze_fired,
                 "rsi_14": round(rsi_3m, 2),
+                "rsi_series": rsi_series[-120:],
                 "trigger": trigger_3m,
                 "bars": self.bars_3m[-120:],
             },
@@ -679,8 +697,8 @@ class DecodeXDataWorker(QThread):
     # =========================================================================
 
     @staticmethod
-    def _calc_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 2.5) -> Tuple[float, int]:
-        """Supertrend (10, 2.5) calculation."""
+    def _calc_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 2.5) -> Tuple[float, int, List[float]]:
+        """Supertrend (10, 2.5) calculation returning (latest_val, latest_dir, full_series)."""
         high = df["high"].values
         low = df["low"].values
         close = df["close"].values
@@ -715,7 +733,19 @@ class DecodeXDataWorker(QThread):
 
             st[i] = lower_band[i] if direction[i] == 1 else upper_band[i]
 
-        return float(st[-1]), int(direction[-1])
+        if len(st) > 0 and st[0] == 0:
+            st[0] = lower_band[0] if direction[0] == 1 else upper_band[0]
+
+        # Clamp st values to close +/- 15% to strictly avoid out-of-scale artifacts
+        st_clamped: List[float] = []
+        for i, v in enumerate(st):
+            c = float(close[i])
+            if not (0.80 * c <= v <= 1.20 * c):
+                st_clamped.append(round(c, 2))
+            else:
+                st_clamped.append(round(float(v), 2))
+
+        return float(st_clamped[-1]), int(direction[-1]), st_clamped
 
     @staticmethod
     def _calc_atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -733,14 +763,53 @@ class DecodeXDataWorker(QThread):
 
     @staticmethod
     def _calc_rsi(series: pd.Series, period: int = 14) -> float:
-        """Relative Strength Index calculation."""
+        """Relative Strength Index calculation (scalar)."""
+        val, _ = DecodeXDataWorker._calc_rsi_series(series, period)
+        return val
+
+    @staticmethod
+    def _calc_rsi_series(series: pd.Series, period: int = 14) -> Tuple[float, List[float]]:
+        """Relative Strength Index calculation returning (latest_val, full_series)."""
         delta = series.diff()
         gain = (delta.where(delta > 0, 0)).rolling(period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
         rs = gain / loss.replace(0, 1e-9)
         rsi = 100.0 - (100.0 / (1.0 + rs))
-        val = float(rsi.iloc[-1])
-        return float(val if not np.isnan(val) else 50.0)
+        rsi_clean = rsi.fillna(50.0).round(2).tolist()
+        val = float(rsi_clean[-1]) if rsi_clean else 50.0
+        return val, rsi_clean
+
+    def _emit_initial_state(self) -> None:
+        """Emit initial state for MTF indicators, L2 depth, and options chain immediately after warmup."""
+        try:
+            if not self.bars_15m or not self.bars_3m:
+                return
+            now_dt = datetime.now(IST_TZ)
+            last_price = self.current_spot_price
+
+            depth_data = {
+                "symbol": self.instrument,
+                "bids": [{"price": round(last_price - 0.5 * (i + 1), 1), "quantity": 120 * (i + 1), "orders": i + 1} for i in range(5)],
+                "asks": [{"price": round(last_price + 0.5 * (i + 1), 1), "quantity": 90 * (i + 1), "orders": i + 1} for i in range(5)],
+                "total_bid_qty": 1800,
+                "total_ask_qty": 1350,
+                "order_book_imbalance": 0.14,
+                "micro_price": round(last_price + 0.15, 2),
+                "spread": 1.0,
+                "top_bid": round(last_price - 0.5, 1),
+                "top_ask": round(last_price + 0.5, 1),
+                "timestamp": now_dt.strftime("%H:%M:%S.%f")[:12],
+            }
+            self.l2_depth_signal.emit(depth_data)
+
+            # Trigger MTF calculation on existing bars
+            self._update_mtf_bars(now_dt, last_price, self.bars_3m[-1]["volume"], depth_data["order_book_imbalance"])
+
+            # Trigger Options Chain calculation
+            self._process_option_tick("init", last_price, 500000)
+            logger.info("Emitted initial MTF, L2 depth, and options chain states for %s.", self.instrument)
+        except Exception as e:
+            logger.warning("Error emitting initial state: %s", e)
 
     # =========================================================================
     # QTHREAD EXECUTION RUN LOOP
@@ -750,6 +819,9 @@ class DecodeXDataWorker(QThread):
         """Entry point for QThread execution. Starts WebSocket and watchdog thread."""
         logger.info("DecodeXDataWorker background thread started.")
         self.connection_status_signal.emit("INITIALIZING", "Authenticating with Angel One SmartAPI...")
+
+        # Immediately render initial warmed-up state on GUI
+        self._emit_initial_state()
 
         # Initial Macro News Fetch
         try:

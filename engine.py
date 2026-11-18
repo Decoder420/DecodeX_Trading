@@ -730,7 +730,7 @@ class DecodeXEngine:
         """Background task polling news and macro sentiment every 45s."""
         while self.is_running:
             try:
-                report = await asyncio.to_thread(self.macro_engine.generate_confluence_report)
+                report = await asyncio.to_thread(self.macro_engine.get_confluence_report)
                 if report:
                     bias = report.get("bias", "NEUTRAL").upper()
                     self.news_payload["bias"] = bias

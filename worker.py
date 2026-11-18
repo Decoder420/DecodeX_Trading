@@ -134,8 +134,11 @@ class DecodeXDataWorker(QThread):
             if not df_15m.empty:
                 df_15m = df_15m.tail(120).copy()
                 for _, row in df_15m.iterrows():
+                    ts_dt = pd.to_datetime(row["timestamp"])
+                    ts_sec = int(ts_dt.timestamp()) if ts_dt.tz else int(pytz.timezone("Asia/Kolkata").localize(ts_dt).timestamp())
                     self.bars_15m.append({
-                        "timestamp": pd.to_datetime(row["timestamp"]),
+                        "timestamp": ts_dt,
+                        "time": ts_sec,
                         "open": float(row["open"]),
                         "high": float(row["high"]),
                         "low": float(row["low"]),
@@ -154,8 +157,11 @@ class DecodeXDataWorker(QThread):
                     "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
                 }).dropna().tail(150)
                 for ts, row in df_3m.iterrows():
+                    ts_dt = pd.to_datetime(ts)
+                    ts_sec = int(ts_dt.timestamp()) if ts_dt.tz else int(pytz.timezone("Asia/Kolkata").localize(ts_dt).timestamp())
                     self.bars_3m.append({
-                        "timestamp": ts,
+                        "timestamp": ts_dt,
+                        "time": ts_sec,
                         "open": float(row["open"]),
                         "high": float(row["high"]),
                         "low": float(row["low"]),
@@ -319,6 +325,10 @@ class DecodeXDataWorker(QThread):
             if is_underlying and ltp > 0:
                 vol = int(message.get("last_traded_quantity", 1))
                 now_dt = datetime.now(IST_TZ)
+                self._update_mtf_bars(now_dt, ltp, vol, depth_data.get("order_book_imbalance", 0.0))
+
+                b15 = self.bars_15m[-1] if self.bars_15m else {}
+                b3 = self.bars_3m[-1] if self.bars_3m else {}
                 tick_payload = {
                     "symbol": self.instrument,
                     "token": token,
@@ -328,9 +338,22 @@ class DecodeXDataWorker(QThread):
                     "low": float(message.get("low_price_of_the_day", 0)) / 100.0,
                     "close": float(message.get("closed_price", 0)) / 100.0,
                     "timestamp": now_dt.strftime("%H:%M:%S"),
+                    "bar_15m": {
+                        "time": b15.get("time", int(now_dt.timestamp())),
+                        "open": b15.get("open", ltp),
+                        "high": b15.get("high", ltp),
+                        "low": b15.get("low", ltp),
+                        "close": b15.get("close", ltp),
+                    } if b15 else None,
+                    "bar_3m": {
+                        "time": b3.get("time", int(now_dt.timestamp())),
+                        "open": b3.get("open", ltp),
+                        "high": b3.get("high", ltp),
+                        "low": b3.get("low", ltp),
+                        "close": b3.get("close", ltp),
+                    } if b3 else None,
                 }
                 self.tick_signal.emit(tick_payload)
-                self._update_mtf_bars(now_dt, ltp, vol, depth_data.get("order_book_imbalance", 0.0))
 
             # 3. Process Options Tick (if option token)
             oi_raw = message.get("open_interest", 0)
@@ -411,16 +434,19 @@ class DecodeXDataWorker(QThread):
         # 1. Update 15m Forming Bar
         m15_minute = (dt.minute // 15) * 15
         bar_15m_time = dt.replace(minute=m15_minute, second=0, microsecond=0)
+        t15_sec = int(bar_15m_time.timestamp() if bar_15m_time.tzinfo else pytz.timezone("Asia/Kolkata").localize(bar_15m_time).timestamp())
 
         if not self.bars_15m or self.bars_15m[-1]["timestamp"] != bar_15m_time:
             self.bars_15m.append({
                 "timestamp": bar_15m_time,
+                "time": t15_sec,
                 "open": price, "high": price, "low": price, "close": price, "volume": volume
             })
             if len(self.bars_15m) > 150:
                 self.bars_15m.pop(0)
         else:
             cur15 = self.bars_15m[-1]
+            cur15["time"] = t15_sec
             cur15["high"] = max(cur15["high"], price)
             cur15["low"] = min(cur15["low"], price)
             cur15["close"] = price
@@ -429,16 +455,19 @@ class DecodeXDataWorker(QThread):
         # 2. Update 3m Forming Bar
         m3_minute = (dt.minute // 3) * 3
         bar_3m_time = dt.replace(minute=m3_minute, second=0, microsecond=0)
+        t3_sec = int(bar_3m_time.timestamp() if bar_3m_time.tzinfo else pytz.timezone("Asia/Kolkata").localize(bar_3m_time).timestamp())
 
         if not self.bars_3m or self.bars_3m[-1]["timestamp"] != bar_3m_time:
             self.bars_3m.append({
                 "timestamp": bar_3m_time,
+                "time": t3_sec,
                 "open": price, "high": price, "low": price, "close": price, "volume": volume
             })
             if len(self.bars_3m) > 200:
                 self.bars_3m.pop(0)
         else:
             cur3 = self.bars_3m[-1]
+            cur3["time"] = t3_sec
             cur3["high"] = max(cur3["high"], price)
             cur3["low"] = min(cur3["low"], price)
             cur3["close"] = price
@@ -553,32 +582,75 @@ class DecodeXDataWorker(QThread):
         target_1 = round(price + 2.0 * atr_15m, 1) if "BULLISH" in final_signal else round(price - 2.0 * atr_15m, 1)
         target_2 = round(price + 3.5 * atr_15m, 1) if "BULLISH" in final_signal else round(price - 3.5 * atr_15m, 1)
 
+        # Build clean ascending TradingView Lightweight Charts payloads
+        candles_15m: List[Dict[str, Any]] = []
+        seen_15 = set()
+        for b in self.bars_15m[-100:]:
+            t = b.get("time", int(b["timestamp"].timestamp()))
+            if t not in seen_15:
+                seen_15.add(t)
+                candles_15m.append({"time": t, "open": b["open"], "high": b["high"], "low": b["low"], "close": b["close"]})
+        candles_15m.sort(key=lambda x: x["time"])
+
+        n15 = len(candles_15m)
+        v_sub = vwap_series[-n15:] if len(vwap_series) >= n15 else vwap_series
+        st_sub = st_series[-n15:] if len(st_series) >= n15 else st_series
+        vwap_data = [{"time": candles_15m[i]["time"], "value": v_sub[i]} for i in range(min(n15, len(v_sub)))]
+        st_data = [{"time": candles_15m[i]["time"], "value": st_sub[i]} for i in range(min(n15, len(st_sub)))]
+
+        candles_3m: List[Dict[str, Any]] = []
+        seen_3 = set()
+        for b in self.bars_3m[-120:]:
+            t = b.get("time", int(b["timestamp"].timestamp()))
+            if t not in seen_3:
+                seen_3.add(t)
+                candles_3m.append({"time": t, "open": b["open"], "high": b["high"], "low": b["low"], "close": b["close"]})
+        candles_3m.sort(key=lambda x: x["time"])
+
+        n3 = len(candles_3m)
+        e9_sub = ema_9_series[-n3:] if len(ema_9_series) >= n3 else ema_9_series
+        e21_sub = ema_21_series[-n3:] if len(ema_21_series) >= n3 else ema_21_series
+        e50_sub = ema_50_series[-n3:] if len(ema_50_series) >= n3 else ema_50_series
+        rsi_sub = rsi_series[-n3:] if len(rsi_series) >= n3 else rsi_series
+        ema9_data = [{"time": candles_3m[i]["time"], "value": e9_sub[i]} for i in range(min(n3, len(e9_sub)))]
+        ema21_data = [{"time": candles_3m[i]["time"], "value": e21_sub[i]} for i in range(min(n3, len(e21_sub)))]
+        ema50_data = [{"time": candles_3m[i]["time"], "value": e50_sub[i]} for i in range(min(n3, len(e50_sub)))]
+        rsi_data = [{"time": candles_3m[i]["time"], "value": rsi_sub[i]} for i in range(min(n3, len(rsi_sub)))]
+
         mtf_payload = {
             "symbol": self.instrument,
             "spot_price": price,
             "15m": {
                 "anchored_vwap": round(anchored_vwap, 2),
                 "vwap_series": vwap_series[-100:],
+                "vwap_data": vwap_data,
                 "supertrend": round(st_val, 2),
                 "supertrend_series": st_series[-100:],
+                "supertrend_data": st_data,
                 "supertrend_direction": st_dir,
                 "daily_atr": round(atr_15m, 2),
                 "bias": bias_15m,
                 "bars": self.bars_15m[-100:],
+                "candles": candles_15m,
             },
             "3m": {
                 "ema_9": round(ema_9, 2),
                 "ema_9_series": ema_9_series[-120:],
+                "ema9_data": ema9_data,
                 "ema_21": round(ema_21, 2),
                 "ema_21_series": ema_21_series[-120:],
+                "ema21_data": ema21_data,
                 "ema_50": round(ema_50, 2),
                 "ema_50_series": ema_50_series[-120:],
+                "ema50_data": ema50_data,
                 "squeeze_on": squeeze_on,
                 "squeeze_fired": squeeze_fired,
                 "rsi_14": round(rsi_3m, 2),
                 "rsi_series": rsi_series[-120:],
+                "rsi_data": rsi_data,
                 "trigger": trigger_3m,
                 "bars": self.bars_3m[-120:],
+                "candles": candles_3m,
             },
             "confluence": {
                 "signal": final_signal,
@@ -807,38 +879,79 @@ class DecodeXDataWorker(QThread):
 
             # Trigger Options Chain calculation
             self._process_option_tick("init", last_price, 500000)
+
+            # Initial News & Macro Report
+            try:
+                rep = self.macro_engine.get_confluence_report()
+                self.macro_sentiment_score = rep.combined_score
+                self.news_sentiment_signal.emit({
+                    "combined_score": rep.combined_score,
+                    "confluence_bias": rep.confluence_bias,
+                    "global_macro_score": rep.global_macro_score,
+                    "news_sentiment_score": rep.news_sentiment_score,
+                    "market_impact_analysis": rep.market_impact_analysis,
+                    "key_drivers": rep.key_drivers,
+                    "macro_quotes": [mq.__dict__ for mq in rep.macro_quotes.values()],
+                    "headlines": [h.__dict__ for h in rep.headlines],
+                    "timestamp": now_dt.strftime("%H:%M:%S"),
+                })
+            except Exception as e:
+                logger.warning("Error emitting initial news report: %s", e)
+
             logger.info("Emitted initial MTF, L2 depth, and options chain states for %s.", self.instrument)
         except Exception as e:
             logger.warning("Error emitting initial state: %s", e)
+
+    def _news_polling_loop(self) -> None:
+        """Non-blocking background loop polling the News API and Global Macro engine every 45 seconds."""
+        logger.info("DecodeX News & Macro polling loop started (interval: 45s).")
+        while self._is_running:
+            try:
+                report = self.macro_engine.get_confluence_report(force_refresh=True)
+                self.macro_sentiment_score = report.combined_score
+                news_payload = {
+                    "combined_score": report.combined_score,
+                    "confluence_bias": report.confluence_bias,
+                    "global_macro_score": report.global_macro_score,
+                    "news_sentiment_score": report.news_sentiment_score,
+                    "market_impact_analysis": report.market_impact_analysis,
+                    "key_drivers": report.key_drivers,
+                    "macro_quotes": [mq.__dict__ for mq in report.macro_quotes.values()],
+                    "headlines": [h.__dict__ for h in report.headlines],
+                    "timestamp": datetime.now(IST_TZ).strftime("%H:%M:%S"),
+                }
+                self.news_sentiment_signal.emit(news_payload)
+                logger.info("Emitted live news & macro confluence report (%d headlines, bias: %s, score: %+.2f).",
+                            len(report.headlines), report.confluence_bias, report.combined_score)
+            except Exception as e:
+                logger.warning("Error in background news polling loop: %s", e)
+
+            # Responsive sleep for 45 seconds
+            for _ in range(45):
+                if not self._is_running:
+                    break
+                time.sleep(1.0)
 
     # =========================================================================
     # QTHREAD EXECUTION RUN LOOP
     # =========================================================================
 
     def run(self) -> None:
-        """Entry point for QThread execution. Starts WebSocket and watchdog thread."""
+        """Entry point for QThread execution. Starts WebSocket, watchdog, and news polling."""
         logger.info("DecodeXDataWorker background thread started.")
         self.connection_status_signal.emit("INITIALIZING", "Authenticating with Angel One SmartAPI...")
 
         # Immediately render initial warmed-up state on GUI
         self._emit_initial_state()
 
-        # Initial Macro News Fetch
-        try:
-            headlines, score, drivers = self.macro_engine._fetch_indian_news()
-            self.macro_sentiment_score = score
-            self.news_sentiment_signal.emit({
-                "score": score,
-                "headlines": [h.__dict__ for h in headlines[:5]],
-                "drivers": drivers,
-            })
-        except Exception as e:
-            logger.warning("Initial macro news fetch skipped: %s", e)
-
         # Launch Watchdog in separate internal daemon thread
         import threading
         watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True, name="DecodeXWatchdog")
         watchdog_thread.start()
+
+        # Launch dedicated background News Polling Thread
+        news_thread = threading.Thread(target=self._news_polling_loop, daemon=True, name="DecodeXNewsPoller")
+        news_thread.start()
 
         # Continuous Connection & Backoff Reconnect Loop
         while self._is_running:

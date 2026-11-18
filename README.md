@@ -1,118 +1,98 @@
-# Quantitative Research Platform (Parts 1 & 2 of 3)
+# DecodeX Trading — Institutional Multi-Timeframe Quant Terminal
 
-A statistical research and decision-support platform designed for generating `BUY` / `SELL` / `NO-TRADE` signals on benchmark Indian market indices: **NIFTY 50**, **BANK NIFTY**, and **BSE SENSEX** (with index futures as the tradable proxy).
+**DecodeX Trading** is an institutional quantitative trading terminal and statistical research platform designed for Indian index derivatives (**NIFTY 50**, **BANK NIFTY**, **BSE SENSEX**).
+
+The system utilizes a decoupled high-frequency architecture: an asynchronous headless Python daemon (`engine.py`) continuously processes broker WebSocket streams, Level-2 microstructure, options chain Greeks, and multi-timeframe indicators into an ultra-low-latency state store (`data/state_store.py`), paired with an interactive Streamlit terminal (`app.py`) featuring embedded TradingView Lightweight Charts, real-time 5Hz updates, and dynamic risk guardrails.
 
 > [!CAUTION]
-> **Regulatory & Risk Disclaimer**: This platform is strictly for personal quantitative research and statistical decision support. It contains **no live order execution** and does **never claim or imply guaranteed profitability**. Market participation involves substantial financial risk.
->
-> **Index Futures Proxy Approximation**: Cash index series are utilized as the tradable proxy for index futures. This approximation assumes zero spot-futures basis and no roll gaps between contract months. BSE SENSEX derivatives prior to their May 2023 relaunch are hypothetical backtest constructs.
+> **Regulatory & Risk Disclaimer**: This platform is strictly for quantitative research, automated paper execution, and statistical decision support. Market participation and derivatives trading involve substantial financial risk.
 
 ---
 
-## Architecture Overview
+## 🏗️ Architecture & Decoupled Execution Pipeline
 
-### Part 1: Data & Feature Engineering
-- **Market Session**: NSE & BSE, 09:15 to 15:30 IST (`Asia/Kolkata` timezone normalized throughout).
-- **Timeframes**: Configurable (`1d` primary, `15m` secondary).
-- **Zero Hardcoding**: All lot sizes, expiry regimes, session hours, holiday lists, provider tokens, and transaction costs are isolated in `config/config.yaml`.
-- **Dynamic Scrip Master**: Angel One tokens are resolved dynamically at runtime from the official scrip master JSON and cached locally (`data/cache/`).
-- **Resilient Fallback**: If Angel One credentials are missing or unauthenticated, the system logs a descriptive message and falls back to Yahoo Finance daily data.
-- **Incremental Storage**: DuckDB storage (`data/market_data.duckdb`) storing one table per instrument with deduplicated incremental upserts.
-- **Lookahead Bias Prevention**: Mathematically verified via pytest. GARCH(1,1) is fitted on rolling windows only; HMM regime labels are computed using filtered forward probabilities and mapped to regimes by fitted variance/return (never by arbitrary state index).
-- **Volume Awareness**: Spot index series do not carry traded volume; intraday VWAP is automatically skipped for index series with explicit logging and only computed when valid volume is present.
+```mermaid
+flowchart TD
+    subgraph DataEngine ["Data Engine Daemon (engine.py)"]
+        SmartAPI["Angel One SmartAPI Mode 3 WebSocket<br/>(Full Depth + Spot Feed)"]
+        Simulator["DecodeX 10Hz Quant Simulator<br/>(Zero-Lag Fallback Feed)"]
+        MTF["Multi-Timeframe Engine<br/>• 15m Structural: Anchored VWAP + Supertrend<br/>• 3m Execution: EMA Ribbon + Squeeze + RSI"]
+        NewsPoller["Live Macro & News Poller<br/>FreeNewsAPI + Global Quotes"]
+        ExecEngine["QuantExecutionEngine<br/>State Machine + Sizing + Mock Broker"]
+        HttpServer["CORS Stream API<br/>http://127.0.0.1:8765/state"]
+    end
 
-### Part 2: Statistical Models, Walk-Forward Backtesting & Execution Engine
-- **Standardized Output Interface**: Every model emits a `SignalPacket` with direction (`BUY` / `SELL` / `NO_TRADE`), confidence, suggested entry ($Open_{t+1}$), ATR-based stop-loss, ATR-based profit target, and time horizon.
-- **Model Suite**:
-  1. *Rule-Based Baselines*: Trend Following (EMA/ADX), Mean Reversion (Bollinger %B & Z-Score), Breakout (Donchian Channel), and Regime Switching (adaptive rule selection by market state).
-  2. *Regularized Linear Models*: Logistic Regression L1 (Lasso) and L2 (Ridge) with chronological calibration and bounded scaling.
-  3. *Gradient Boosted Decision Trees*: LightGBM Direction (Model 3A) and LightGBM Triple Barrier (Model 3B with exact 2.0 ATR target, 1.5 ATR stop, 10 bar limit) with native Tree SHAP explainability.
-  4. *Consensus Voting Ensemble*: Fires only when $\ge 2$ independent models agree on direction with zero opposing dissent.
-- **Walk-Forward Validation**: 10 expanding chronological folds (2015–2024), 10-bar purging, 5-bar embargoing.
-- **Sealed Out-Of-Sample Holdout**: Last 2 years (`2024-11-01` to `2026-10-23`) locked by `HoldoutManager` with cryptographic tampering checks.
-- **Realistic Execution**:
-  - Next-open fills (no same-bar execution).
-  - Open gaps beyond stop or target filled at actual Open price.
-  - Conservative stop-loss priority on dual barrier breaches.
-  - Effective-dated statutory transaction costs: STT (0.02% sell side), GST (18%), stamp duty (0.002% buy side), exchange turnover charges, SEBI fee, and Rs 20 brokerage.
-  - Base slippage (1.5 bps) vs stress slippage (5.0 bps).
-- **Risk Management & Gating**:
-  - Volatility-targeted position sizing (15% portfolio vol), fixed fractional risk (1.0% per trade), max daily loss limit (2.5%).
-  - Portfolio Drawdown Kill Switch (15%) with a **20-day pause & restart rule**.
-  - Multi-gate filter: Data Gap blackout, Confidence gate, Regime gate, VIX percentile gate, and Expiry Day A/B filter.
+    subgraph StateStorage ["Ultra-Low-Latency State Store"]
+        RedisStore[("Local Redis In-Memory Key-Value Store")]
+        AtomicFile[("Atomic JSON File Store<br/>(&lt;0.3ms POSIX Atomic os.replace)")]
+    end
 
----
+    subgraph StreamlitUI ["Frontend Execution Terminal (app.py)"]
+        HeaderFrag["Header Bar @st.fragment(1s)<br/>Spot Price, Latency & Confluence Banner"]
+        TVChart["TradingView Lightweight Charts<br/>Inlined Bundle • 5Hz Client-Side Poller"]
+        TelemetryFrag["Telemetry Tabs @st.fragment(1s)<br/>• L2 Depth & OBI<br/>• Audit & Orders Log<br/>• Global Macro News<br/>• Options Chain Grid"]
+        SidebarCtrl["Dynamic Risk & Position Sizing<br/>• Account Equity & Risk %<br/>• Small-Account Guard"]
+    end
 
-## Directory Layout
+    SmartAPI --> MTF
+    Simulator --> MTF
+    MTF --> ExecEngine
+    NewsPoller --> ExecEngine
+    ExecEngine --> RedisStore
+    ExecEngine --> AtomicFile
+    ExecEngine --> HttpServer
 
-```text
-├── config/
-│   ├── config.yaml               # Master YAML configuration & effective-dated cost schedules
-│   ├── holidays.yaml             # NSE/BSE official trading holidays calendar (2010–2026)
-│   └── loader.py                 # Configuration manager & time-varying calendar logic
-├── data/
-│   ├── base_provider.py          # Abstract BaseDataProvider interface
-│   ├── yfinance_provider.py      # Yahoo Finance provider (daily + 15m fallback)
-│   ├── angel_provider.py         # Angel One SmartAPI provider (rate limits, TOTP, chunking)
-│   ├── upstox_provider.py        # Upstox V2 provider adapter stub
-│   ├── cleaner.py                # Data validation, outlier flagging, gap auditing
-│   ├── storage.py                # DuckDB persistence with incremental upserts
-│   ├── quality_report.py         # Tabular data quality report generator
-│   ├── provider_factory.py       # Orchestrator with fallback & date range expansion
-│   ├── market_data.duckdb        # Ingested daily data (~4,130 bars per instrument)
-│   └── experiments/              # JSONL experiment run tracker
-├── features/
-│   ├── trend.py                  # EMA 9/21/50/200, ADX, Supertrend, VWAP, HH/HL structure
-│   ├── momentum.py               # RSI, MACD, ROC, Stochastic %K/%D, Return Z-score
-│   ├── volatility.py             # ATR, Bollinger width, Realized Vol, GARCH(1,1), India VIX rank
-│   ├── mean_reversion.py         # Distance from MA in ATR units, rolling Hurst exponent, ADF p-value
-│   ├── calendar.py               # Day of week, time-varying expiry flags, gap %, month-end
-│   ├── regime.py                 # HMM (filtered forward probs) & rolling stats regime classification
-│   └── pipeline.py               # Orchestrator computing all feature sets
-├── models/
-│   ├── base.py                   # BaseSignalModel abstract class & SignalPacket dataclass
-│   ├── calibration.py            # Chronological calibration slice, Platt & Isotonic calibrators, ECE
-│   ├── baselines.py              # Trend, Mean Reversion, Breakout, Regime Switching models
-│   ├── linear.py                 # Regularized Logistic Regression (L1/L2)
-│   ├── tree_models.py            # LightGBM Direction & Triple Barrier models with SHAP
-│   ├── ensemble.py               # Consensus Voting Ensemble
-│   ├── labels.py                 # Forward returns & Triple Barrier labeling
-│   └── artifacts/                # Versioned model artifacts & audit manifests
-├── backtest/
-│   ├── engine.py                 # Event-driven execution engine (next-open fills, gap fills)
-│   ├── costs.py                  # Effective-dated statutory cost calculator & slippage
-│   ├── holdout.py                # 2-year out-of-sample holdout guard & access audit
-│   ├── position_sizing.py        # Volatility targeting, fractional risk, drawdown kill switch
-│   ├── walk_forward.py           # Expanding walk-forward backtest runner with purging & embargoing
-│   ├── metrics.py                # CAGR, Sharpe, Sortino, MaxDD, Win Rate, Expectancy, Weak sample flag
-│   ├── robustness.py             # Deflated Sharpe Ratio, Bootstrap CI, Monte Carlo noise benchmark
-│   ├── tracker.py                # Experiment logger and versioned artifact repository
-│   └── reporter.py               # Markdown report generator with proxy disclaimers
-├── signals/
-│   ├── gates.py                  # TradeGatekeeper & multi-gate filtering
-│   └── ...                       # Reserved for Part 3 (Service & Endpoints)
-├── dashboard/                    # Reserved for Part 3 (Streamlit App)
-├── tests/
-│   ├── test_backtest_engine.py   # No same-bar fills, open gap fills, dual breach priority, holdout
-│   ├── test_calendar_rules.py    # Time-varying lot sizes & expiry holiday shifts
-│   ├── test_costs.py             # Hand-verified statutory cost math for 2012, 2018, 2025
-│   ├── test_data_cleaning.py     # Duplicates, invalid prices, outlier flags, gaps
-│   ├── test_lookahead.py         # Anti-leakage tests: full vs truncated dataset equivalence
-│   ├── test_providers.py         # Fallback, rate limits, storage upsert
-│   ├── test_signal_models.py     # Calibration slice separation, Model 3B exact exits, ensemble
-│   └── test_walk_forward.py      # Expanding folds, 10-bar purging, gap date trading exclusion
-├── scripts/
-│   ├── run_pipeline.py           # Data ingestion & feature matrix generator
-│   └── run_model_comparison.py   # Master walk-forward model evaluation & Decision Gate runner
-├── reports/                      # Detailed model evaluation markdown reports
-├── .env.example                  # Template for credentials
-├── requirements.txt              # Pinned Python dependencies
-└── PROJECT_STATE.md              # Living architecture state, Decision Gate results, and handoffs
+    RedisStore --> HeaderFrag
+    AtomicFile --> HeaderFrag
+    RedisStore --> TelemetryFrag
+    AtomicFile --> TelemetryFrag
+    HttpServer -.->|5Hz fetch| TVChart
+    SidebarCtrl -->|Controls Sync| StateStorage
 ```
 
 ---
 
-## Setup & Quickstart
+## ⚡ Core Modules & Features
+
+### 1. Real-Time Data Pipeline & Latency Telemetry (`engine.py`)
+- **Angel One SmartAPI Mode 3 (FULL_SNAP)** WebSocket integration with automated exponential backoff ($2\text{s} \to 4\text{s} \to 8\text{s} \to \dots \le 60\text{s}$) and reconnect watchdog.
+- **Zero-Downtime Fallback**: Automatically switches to the low-latency 10Hz quant simulator during after-hours or API drops so charts and state machines never stall.
+- **Unified Continuous Historical Warmup**: Smoothly joins previous session afternoon close (13:00–15:30 IST) into today's 09:15 AM IST session, guaranteeing exact 15m and 3m closing price consistency without artificial spikes.
+- **Low-Latency Telemetry**: Live pipeline latency tracking (e.g. `⚡ 12.0ms Latency | 10Hz Feed`).
+
+### 2. 6-Factor MTF Confluence State Machine (`data/execution_engine.py`)
+$$\text{WAIT} \longrightarrow \text{EXECUTE} \longrightarrow \text{POSITION\_OPEN} \longrightarrow \text{TRAILING\_STOP} \longrightarrow \text{TARGET\_HIT} \; / \; \text{STOPPED\_OUT}$$
+- **15m Structural Bias**: Anchored Session VWAP and Supertrend $(10, 2.5)$.
+- **3m Execution Triggers**: EMA Ribbon $(9, 21, 50)$, Volatility Squeeze (Bollinger Bands vs Keltner Channels), and RSI(14) momentum filter.
+- **Dual Operating Modes**:
+  - `Active Quant Execution (Live Signals)`: Auto-dispatches orders to mock broker and logs entries to the persistent DuckDB ledger when Confluence Score $\ge 4.0$.
+  - `Strict Risk Gatekeeper (Read-Only)`: Suppresses trade execution and generates audit alerts.
+- **3-Stage Breakeven Lock & Runner Trailing SL**:
+  - **Stage 0**: Initial $1.5 \times \text{ATR}$ stop-loss.
+  - **Stage 1**: Target 1 reached $\to$ Stop-loss automatically moves to Entry (Breakeven Locked).
+  - **Stage 2**: Price advances $> 1.8 \times \text{ATR}$ $\to$ Trailing stop advances at $1.0 \times \text{ATR}$ behind price.
+
+### 3. Dynamic Position Sizing & Small-Account Guard (`data/risk_engine.py`)
+- **Capital Allocation Formulas**:
+  $$\text{Max Risk (INR)} = \text{Account Equity} \times \left(\frac{\text{Risk } \%}{100}\right)$$
+  $$\text{Stop Distance} = \text{Daily ATR} \times \text{Multiplier}$$
+  $$\text{1-Lot Risk} = \text{Stop Distance} \times \text{Lot Size}$$
+  $$\text{Recommended Lots} = \left\lfloor \frac{\text{Max Risk}}{\text{1-Lot Risk}} \right\rfloor$$
+- **Small-Account Guard**: If 1 minimum lot risk exceeds total allocated risk budget, order execution is strictly blocked (`BLOCKED`), size set to 0, and a warning is surfaced.
+
+### 4. High-Performance Frontend Terminal (`app.py`)
+- **Flicker-Free TradingView Supercharts**: Inlined TradingView Lightweight Charts bundle updating at 5Hz via client-side polling (`http://127.0.0.1:8765/state`) with zero iframe reloads.
+- **Dedicated Sub-Header HUD**: Clean OHLC + indicator metrics strip without visual text overlap on chart candles.
+- **Institutional Telemetry Tabs**:
+  - `⚡ L2 Depth`: 5-level market depth matrix with Order Book Imbalance (OBI) and micro-price.
+  - `📜 Audit & Orders`: Real-time position card (Strike, Entry, SL, Target, Unrealized PnL) and rolling event log.
+  - `📰 Market News`: Live Indian financial headlines and global macro quotes (USD/INR, Brent, US10Y).
+  - `📊 Options Grid`: Real-time ATM $\pm$ 200 triad with COI deltas, IVs, and Greeks.
+- **Web Audio Chime**: Synthesized zero-dependency browser chime on signal shifts and order execution.
+
+---
+
+## 🚀 Quickstart & Setup
 
 ### 1. Environment Preparation
 ```bash
@@ -121,51 +101,73 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Run Data Pipeline (Part 1)
+### 2. Configure Credentials (`.env`)
 ```bash
-# Ingest historical data, engineer features, and display Data Quality Report
-python scripts/run_pipeline.py --symbols NIFTY BANKNIFTY SENSEX --days 365
+cp .env.example .env
+# Edit .env with your Angel One SmartAPI credentials (optional for quant simulator mode):
+# ANGEL_API_KEY=...
+# ANGEL_CLIENT_ID=...
+# ANGEL_MPIN=...
+# ANGEL_TOTP_SECRET=...
 ```
 
-### 3. Run Walk-Forward Model Comparison (Part 2)
+### 3. Launch the Terminal
+
+Open two terminal tabs:
+
+**Terminal 1 — Start Data Engine Daemon:**
 ```bash
-# Evaluates all 9 models across NIFTY, BANKNIFTY, SENSEX, and POOLED with 10 expanding folds
-python scripts/run_model_comparison.py
+source .venv/bin/activate
+python engine.py --instrument NIFTY --expiry 17NOV2026
 ```
 
-Reports and summary tables are automatically generated in `reports/MODEL_COMPARISON_SUMMARY.md` and `reports/report_<INSTRUMENT>_<MODEL>.md`.
-
-### 4. Run Test Suite
+**Terminal 2 — Start Streamlit Frontend:**
 ```bash
-# Run all 38 tests (anti-leakage proofs, cost math, execution logic, model gates, ensemble re-fitting)
-.venv/bin/pytest -v
+source .venv/bin/activate
+streamlit run app.py
+```
+*(Navigate to `http://localhost:8501` in your browser).*
+
+---
+
+## 🧪 Testing & Verification
+
+Run the full quant execution, decoupled architecture, and macro test suite:
+```bash
+source .venv/bin/activate
+pytest tests/test_quant_execution.py tests/test_decoupled_architecture.py tests/test_options_and_macro.py -v
 ```
 
 ---
 
-## Decision Gate Summary (Part 2 - Audited)
+## 📁 Repository Structure
 
-> [!CAUTION]
-> **Core Quantitative Finding**: **NO MODEL IS VALIDATED.**
-> All tested strategies fail multiple institutional robustness criteria (e.g., bootstrap difference CI spans zero, Deflated Sharpe Ratio p-value >= 0.10, or lack of consistency).
-> All candidates are strictly classified as **"marginal, unconfirmed"** (Class B or Class C). Live trading is strictly discouraged.
-
-| Instrument | Model | Out-of-Sample Trades | Win Rate % | Net P&L (INR) | Sharpe (1.5 bps) | Sharpe (5.0 bps) | B&H Sharpe | Exposure % | Excess vs Exp-B&H | DSR p-value | Diff CI Excludes 0 | Decision Gate Classification |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **NIFTY** | Baseline_Trend_EMA_ADX | 3 | 66.7% | Rs 31,826 | 0.36 | 0.35 | 0.63 | 0.4% | +0.3% | 0.936 | No | **Class B (Weak sample)** |
-| **BANKNIFTY** | Logistic_Regression_L2 | 217 | 47.5% | Rs 203,696 | 0.27 | 0.17 | 0.59 | 42.2% | -2.8% | 0.964 | No | **Class B (Marginal Edge)** |
-| **BANKNIFTY** | Logistic_Regression_L1 | 203 | 47.3% | Rs 200,200 | 0.27 | 0.17 | 0.59 | 39.4% | -2.5% | 0.965 | No | **Class B (Marginal Edge)** |
-| **SENSEX** | Baseline_Trend_EMA_ADX | 3 | 33.3% | Rs 4,217 | 0.06 | 0.04 | 0.61 | 0.8% | -0.0% | 0.993 | No | **Class B (Weak sample)** |
-| **SENSEX** | Baseline_Regime_Switching | 3 | 33.3% | Rs 4,217 | 0.06 | 0.04 | 0.61 | 0.8% | -0.0% | 0.993 | No | **Class B (Weak sample)** |
-| **BANKNIFTY** | Baseline_Trend_EMA_ADX | 5 | 40.0% | Rs 1,436 | 0.02 | 0.01 | 0.59 | 1.4% | -0.1% | 0.995 | No | **Class B (Weak sample)** |
-| *All Instruments* | LightGBM Triple Barrier | 132–160 | 34–40% | Negative | < -0.17 | < -0.29 | ~0.60 | 23–29% | Negative | 1.000 | No | **Class C (No Edge After Costs)** |
-| *All Instruments* | Consensus Ensemble | 42–67 | 32–37% | Negative | < -0.56 | < -0.51 | ~0.60 | 7–13% | Negative | 1.000 | No | **Class C (No Edge After Costs)** |
-| *All Instruments* | Breakout (Donchian) | 82–97 | 45–48% | Negative | < -0.01 | < -0.11 | ~0.60 | 23–31% | Negative | ~0.997 | No | **Class C (No Edge After Costs)** |
-| *All Instruments* | Mean Reversion | 0 | 0.0% | Rs 0 | 0.00 | 0.00 | ~0.60 | 0.0% | 0.0% | 0.996 | No | **Class C (Untested / 0 Trades)** |
-
----
-
-## Next Steps (Part 3)
-- Build real-time daily signal generation service in `signals/` for decision support and risk monitoring.
-- Deploy FastAPI endpoints for signal queries and risk diagnostics.
-- Build interactive Streamlit decision-support dashboard in `dashboard/`.
+```text
+├── app.py                         # Streamlit quant execution dashboard
+├── engine.py                      # Headless async quant data daemon & CORS API
+├── types/
+│   └── decodex.ts                 # TypeScript data contracts & interfaces
+├── dashboard/
+│   ├── app.py                     # Redirect pointer to root app.py
+│   ├── tradingview_streamlit.py   # Inlined TradingView bundle & 5Hz live poller
+│   ├── tradingview_bridge.py      # Lightweight Charts HTML generators
+│   └── static/                    # Local lightweight-charts production bundle
+├── data/
+│   ├── state_store.py             # Ultra-low-latency Redis + atomic JSON file store
+│   ├── execution_engine.py        # 6-Factor MTF confluence state machine & mock broker
+│   ├── risk_engine.py             # Dynamic risk sizing & Small-Account Guard
+│   ├── storage.py                 # DuckDB historical OHLCV storage
+│   ├── paper_trading.py           # Persistent paper trading database ledger
+│   └── angel_provider.py          # Angel One SmartAPI provider
+├── signals/
+│   ├── macro_sentiment.py         # Indian financial news & global macro scraper
+│   └── engine.py                  # Quantitative signal engine
+├── tests/
+│   ├── test_quant_execution.py    # Unit tests for risk sizing, gatekeeper, & trailing SL
+│   ├── test_decoupled_architecture.py # Unit tests for StateStore and engine state
+│   └── test_options_and_macro.py  # Unit tests for options chain and news sentiment
+├── config/
+│   ├── config.yaml                # Master configuration file
+│   └── holidays.yaml              # NSE/BSE holiday schedule
+└── requirements.txt               # Pinned Python dependencies
+```

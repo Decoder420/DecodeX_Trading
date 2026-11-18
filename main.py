@@ -1,22 +1,24 @@
 """DecodeX Trading — Native Desktop Quantitative Execution Terminal.
 
 Role:
-- Main PyQt6 Desktop Application Window powered by PyQtGraph with OpenGL hardware acceleration.
+- Main PyQt6 Desktop Application Window powered by embedded TradingView Lightweight Charts (QWebEngineView).
 - Built natively for macOS (Apple Silicon / M-Series) with High-DPI Retina scaling.
-- Connects to DecodeXDataWorker (QThread) to receive real-time ticks, 5-level depth, and MTF signals.
+- Connects to DecodeXDataWorker (QThread) to receive real-time ticks, 5-level depth, MTF signals, and live news.
 - Ultra-low latency split-pane layout:
-    * Top Plot: 15-Minute Structural Frame (Candlesticks, Anchored VWAP, Supertrend 10, 2.5).
-    * Bottom Plot: 3-Minute Execution Frame (Candlesticks, EMA Ribbon 9/21/50, Squeeze Metrics).
-    * Sub-Plot: 3-Minute RSI(14) Momentum Oscillator.
-- Dedicated Level-2 Order Book Imbalance (OBI) LCD widget & 5-level market depth matrix.
-- Dynamic Real-Time Options Chain Grid (QTableWidget) with live COI delta and writing highlights.
-- 6-Factor MTF Confluence state machine: strictly validates that entries only fire on MTF convergence.
+    * Top View: 15-Minute Structural Frame (TradingView Candlesticks, Anchored VWAP, Supertrend 10, 2.5).
+    * Bottom View: 3-Minute Execution Frame (TradingView Candlesticks, EMA Ribbon 9/21/50, Squeeze Metrics, RSI 14).
+    * Right Panel: Tabbed Institutional Telemetry:
+        - Tab 1: Execution Telemetry (6-Factor MTF Confluence Gate, L2 Depth & OBI Matrix, Real-Time Options Chain Grid).
+        - Tab 2: Live Market News & Macro Confluence (Real-Time Indian News Feed, Global Macro Tickers, Sentiment Breakdown).
+        - Tab 3: Risk Management & Quant Governance (Dynamic Position Sizing, 3-Stage Breakeven Lock, Risk Guards, Toggles).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -32,9 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # Ensure Qt plugin path and remove macOS hidden file flags
 qt_plugins = PROJECT_ROOT / ".venv" / "lib" / "python3.12" / "site-packages" / "PyQt6" / "Qt6" / "plugins"
 if qt_plugins.exists():
-    # Remove macOS UF_HIDDEN attribute that pip wheels sometimes set
     if sys.platform == "darwin":
-        import subprocess
         try:
             subprocess.run(["chflags", "-R", "0", str(qt_plugins)], capture_output=True)
             subprocess.run(["xattr", "-rc", str(qt_plugins)], capture_output=True)
@@ -45,34 +45,35 @@ if qt_plugins.exists():
         del os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"]
 
 import numpy as np
-import pyqtgraph as pg
 from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtCore import Qt, pyqtSlot
-from PyQt6.QtGui import QBrush, QColor, QFont, QPen
+from PyQt6.QtCore import Qt, QUrl, pyqtSlot
+from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QPixmap
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMainWindow,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QSpinBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
+from dashboard.tradingview_bridge import get_tradingview_15m_html, get_tradingview_3m_html
 from worker import DecodeXDataWorker
-
-# Configure PyQtGraph global options for ultra-low latency & Apple Silicon Metal/OpenGL
-try:
-    pg.setConfigOptions(useOpenGL=True, antialias=True)
-except Exception:
-    pg.setConfigOptions(useOpenGL=False, antialias=True)
-pg.setConfigOption("background", "#1E222D")
-pg.setConfigOption("foreground", "#787B86")
 
 
 # =============================================================================
@@ -111,70 +112,6 @@ def format_qty(val: Any) -> str:
 
 
 # =============================================================================
-# HIGH-PERFORMANCE CANDLESTICK GRAPHICS ITEM (QPICTURE CACHED)
-# =============================================================================
-
-class CandlestickItem(pg.GraphicsObject):
-    """Ultra-low latency custom Candlestick GraphicsItem using QPicture caching.
-    
-    Renders 500+ candlesticks at 60 FPS without GPU or CPU stutter on macOS Retina displays.
-    """
-
-    def __init__(self, data: Optional[List[Tuple[float, float, float, float, float]]] = None):
-        super().__init__()
-        # data format: [(index, open, close, low, high), ...]
-        self.data = data or []
-        self.picture = QtGui.QPicture()
-        self._generate_picture()
-
-    def set_data(self, data: List[Tuple[float, float, float, float, float]]) -> None:
-        self.data = data
-        self._generate_picture()
-        self.prepareGeometryChange()
-        self.update()
-
-    def _generate_picture(self) -> None:
-        """Pre-record painting commands into a fast QPicture cache with TradingView dark aesthetics."""
-        self.picture = QtGui.QPicture()
-        painter = QtGui.QPainter(self.picture)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-
-        w = 0.36  # Candle bar half-width
-        # TradingView Standard Color Palette
-        green_pen = QPen(QColor("#089981"), 1.2)
-        green_brush = QBrush(QColor("#089981"))
-        red_pen = QPen(QColor("#F23645"), 1.2)
-        red_brush = QBrush(QColor("#F23645"))
-
-        for (t, o, c, l, h) in self.data:
-            if c >= o:
-                painter.setPen(green_pen)
-                painter.setBrush(green_brush)
-            else:
-                painter.setPen(red_pen)
-                painter.setBrush(red_brush)
-
-            # Draw Wick
-            painter.drawLine(QtCore.QPointF(t, l), QtCore.QPointF(t, h))
-
-            # Draw Real Body
-            body_top = max(o, c)
-            body_bottom = min(o, c)
-            body_h = max(0.4, body_top - body_bottom)
-            painter.drawRect(QtCore.QRectF(t - w, body_bottom, w * 2.0, body_h))
-
-        painter.end()
-
-    def paint(self, painter, *args) -> None:
-        painter.drawPicture(0, 0, self.picture)
-
-    def boundingRect(self) -> QtCore.QRectF:
-        if not self.data:
-            return QtCore.QRectF(0, 0, 1, 1)
-        return QtCore.QRectF(self.picture.boundingRect())
-
-
-# =============================================================================
 # MAIN DECODEX TRADING APPLICATION WINDOW
 # =============================================================================
 
@@ -188,9 +125,9 @@ class DecodeXMainWindow(QMainWindow):
         self.setWindowTitle("DecodeX Trading — Institutional Multi-Timeframe Quant Terminal")
         icon_path = str(PROJECT_ROOT / "assets" / "decodex_icon.png")
         if os.path.exists(icon_path):
-            self.setWindowIcon(QtGui.QIcon(icon_path))
+            self.setWindowIcon(QIcon(icon_path))
 
-        self.resize(1720, 1020)
+        self.resize(1740, 1040)
         self.setMinimumSize(1280, 800)
 
         # State Variables
@@ -198,6 +135,28 @@ class DecodeXMainWindow(QMainWindow):
         self.current_expiry = "17NOV2026"
         self.spot_price = 25044.65
         self.current_obi = 0.0
+        self.last_signal = "CONFLUENCE WAIT"
+
+        # Risk Management State
+        self.account_equity = 1_000_000.0
+        self.risk_pct = 1.0
+        self.atr_mult = 1.5
+        self.enable_sound_chime = True
+        self.enable_hard_sl = True
+
+        # WebEngine chart readiness and cached data
+        self._chart_15m_ready = False
+        self._chart_3m_ready = False
+        self._last_p15 = None
+        self._last_p3 = None
+
+        # Indicator values cache for live tick updates
+        self.last_vwap = self.spot_price
+        self.last_st = self.spot_price
+        self.last_ema9 = self.spot_price
+        self.last_ema21 = self.spot_price
+        self.last_ema50 = self.spot_price
+        self.last_rsi = 50.0
 
         # Build UI Architecture
         self._setup_institutional_theme()
@@ -282,9 +241,36 @@ class DecodeXMainWindow(QMainWindow):
             background-color: #1E222D;
             border: 1px solid #363A45;
             selection-background-color: #2A2E39;
-            selection-color: #2962FF;
+            selection-color: #00E5FF;
             color: #D1D4DC;
             padding: 4px;
+        }
+        QTabWidget::pane {
+            border: 1px solid #2A2E39;
+            border-radius: 8px;
+            background-color: #1E222D;
+            padding: 6px;
+        }
+        QTabBar::tab {
+            background: #181B24;
+            color: #787B86;
+            font-weight: 700;
+            font-size: 11px;
+            padding: 7px 14px;
+            margin-right: 4px;
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
+            border: 1px solid #2A2E39;
+            border-bottom: none;
+        }
+        QTabBar::tab:selected {
+            background: #1E222D;
+            color: #00E5FF;
+            border-bottom: 2px solid #00E5FF;
+        }
+        QTabBar::tab:hover:!selected {
+            background: #222632;
+            color: #D1D4DC;
         }
         QTableWidget {
             background-color: #1E222D;
@@ -332,15 +318,63 @@ class DecodeXMainWindow(QMainWindow):
         QSplitter::handle {
             background-color: #131722;
         }
+        QSlider::groove:horizontal {
+            height: 4px;
+            background: #2A2E39;
+            border-radius: 2px;
+        }
+        QSlider::sub-page:horizontal {
+            background: #2962FF;
+            border-radius: 2px;
+        }
+        QSlider::handle:horizontal {
+            background: #00E5FF;
+            border: 1px solid #2962FF;
+            width: 14px;
+            margin-top: -5px;
+            margin-bottom: -5px;
+            border-radius: 7px;
+        }
+        QProgressBar {
+            background-color: #2A2E39;
+            border: 1px solid #363A45;
+            border-radius: 4px;
+            text-align: center;
+            font-size: 10px;
+            font-weight: 700;
+            color: #F8FAFC;
+            height: 14px;
+        }
+        QProgressBar::chunk {
+            background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #089981, stop:1 #00E5FF);
+            border-radius: 3px;
+        }
+        QCheckBox {
+            spacing: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #D1D4DC;
+        }
+        QCheckBox::indicator {
+            width: 15px;
+            height: 15px;
+            border-radius: 3px;
+            border: 1px solid #363A45;
+            background: #2A2E39;
+        }
+        QCheckBox::indicator:checked {
+            background: #2962FF;
+            border-color: #00E5FF;
+        }
         """
         self.setStyleSheet(qss)
 
     # =========================================================================
-    # UI COMPOSITION (SPLIT-PANE + CHARTS + TELEMETRY + OPTIONS CHAIN)
+    # UI COMPOSITION (SPLIT-PANE + CHARTS + TELEMETRY + OPTIONS CHAIN + NEWS)
     # =========================================================================
 
     def _build_ui_layout(self) -> None:
-        """Compose split-pane layout with PyQtGraph charts (70%) and telemetry panels (30%)."""
+        """Compose split-pane layout with TradingView WebEngine charts (70%) and telemetry tabs (30%)."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
@@ -354,7 +388,7 @@ class DecodeXMainWindow(QMainWindow):
         work_splitter = QSplitter(Qt.Orientation.Horizontal)
         work_splitter.setHandleWidth(5)
 
-        # Left: Vertical Chart Splitter (15m Top Chart + 3m Bottom Chart + RSI)
+        # Left: Vertical Chart Splitter (15m Top Chart + 3m Bottom Chart)
         chart_container = QWidget()
         chart_layout = QVBoxLayout(chart_container)
         chart_layout.setContentsMargins(0, 0, 0, 0)
@@ -363,118 +397,35 @@ class DecodeXMainWindow(QMainWindow):
         self.chart_splitter = QSplitter(Qt.Orientation.Vertical)
         self.chart_splitter.setHandleWidth(5)
 
-        # Setup Top 15m Structural Chart
-        self.plot_15m = self._create_plot_widget(
-            title="15-Minute Structural Frame (Anchored VWAP & Supertrend 10, 2.5)"
-        )
-        self.candle_item_15m = CandlestickItem()
-        self.plot_15m.addItem(self.candle_item_15m)
-        self.vwap_curve_15m = self.plot_15m.plot(pen=pg.mkPen(color="#00E5FF", width=2.0, name="Anchored VWAP"))
-        self.supertrend_curve_15m = self.plot_15m.plot(pen=pg.mkPen(color="#089981", width=1.6, name="Supertrend (10, 2.5)"))
-        self.chart_splitter.addWidget(self.plot_15m)
+        # Setup Top 15m Structural Chart (TradingView QWebEngineView)
+        self.chart_15m_view = QWebEngineView()
+        self.chart_15m_view.setStyleSheet("background-color: #1E222D; border-radius: 8px;")
+        self.chart_15m_view.loadFinished.connect(self._on_15m_chart_loaded)
+        self.chart_15m_view.setHtml(get_tradingview_15m_html(), QUrl("http://localhost"))
+        self.chart_splitter.addWidget(self.chart_15m_view)
 
-        # Setup Bottom 3m Execution Chart
-        self.plot_3m = self._create_plot_widget(
-            title="3-Minute Execution Frame (EMA Ribbon 9/21/50 & Volatility Squeeze)"
-        )
-        self.candle_item_3m = CandlestickItem()
-        self.plot_3m.addItem(self.candle_item_3m)
-        self.ema9_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#F59E0B", width=1.5, name="EMA 9"))
-        self.ema21_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#FF6D00", width=1.5, name="EMA 21"))
-        self.ema50_curve_3m = self.plot_3m.plot(pen=pg.mkPen(color="#AB47BC", width=1.5, name="EMA 50"))
-        self.chart_splitter.addWidget(self.plot_3m)
-
-        # Setup Sub-Dock: 3m RSI (14) Momentum
-        self.plot_rsi = pg.PlotWidget()
-        self.plot_rsi.setBackground("#1E222D")
-        self.plot_rsi.getViewBox().setBorder(pg.mkPen(color="#2A2E39", width=1))
-        self.plot_rsi.showAxis("top", False)
-        self.plot_rsi.showAxis("right", False)
-        self.plot_rsi.showGrid(x=True, y=True, alpha=0.30)
-        self.plot_rsi.setMaximumHeight(120)
-        self.plot_rsi.setTitle(
-            "<span style='color: #787B86; font-weight: 600; font-size: 10px; font-family: -apple-system, sans-serif;'>"
-            "RSI (14) MOMENTUM OSCILLATOR</span>"
-        )
-
-        b_axis = self.plot_rsi.getAxis("bottom")
-        b_axis.setPen(pg.mkPen(color="#2A2E39", width=1))
-        b_axis.setTextPen(pg.mkPen(color="#787B86"))
-        b_axis.setStyle(tickFont=QFont("SF Mono", 8))
-        b_axis.enableAutoSIPrefix(False)
-
-        l_axis = self.plot_rsi.getAxis("left")
-        l_axis.setPen(pg.mkPen(color="#2A2E39", width=1))
-        l_axis.setTextPen(pg.mkPen(color="#787B86"))
-        l_axis.setStyle(tickFont=QFont("SF Mono", 8))
-        l_axis.enableAutoSIPrefix(False)
-
-        self.plot_rsi.addLine(y=70, pen=pg.mkPen(color="#F23645", width=1, style=Qt.PenStyle.DashLine))
-        self.plot_rsi.addLine(y=50, pen=pg.mkPen(color="#475569", width=1, style=Qt.PenStyle.DotLine))
-        self.plot_rsi.addLine(y=30, pen=pg.mkPen(color="#089981", width=1, style=Qt.PenStyle.DashLine))
-        self.rsi_curve = self.plot_rsi.plot(pen=pg.mkPen(color="#2962FF", width=1.6))
-        self.chart_splitter.addWidget(self.plot_rsi)
-
-        # Link RSI X-axis to 3m Execution chart (shares identical 3m bar sequence)
-        self.plot_rsi.setXLink(self.plot_3m)
+        # Setup Bottom 3m Execution Chart with Integrated RSI (TradingView QWebEngineView)
+        self.chart_3m_view = QWebEngineView()
+        self.chart_3m_view.setStyleSheet("background-color: #1E222D; border-radius: 8px;")
+        self.chart_3m_view.loadFinished.connect(self._on_3m_chart_loaded)
+        self.chart_3m_view.setHtml(get_tradingview_3m_html(), QUrl("http://localhost"))
+        self.chart_splitter.addWidget(self.chart_3m_view)
 
         chart_layout.addWidget(self.chart_splitter)
         work_splitter.addWidget(chart_container)
 
-        # Right: Institutional Telemetry Panel (L2 Depth, Confluence, Options Grid)
-        work_splitter.addWidget(self._build_telemetry_panel())
+        # Right: Institutional Telemetry & Control Tabs
+        work_splitter.addWidget(self._build_right_tabs_panel())
 
-        # Set splitter balance: 70% Charts, 30% Panels
+        # Set splitter proportions: 70% Charts, 30% Right Panel
         work_splitter.setStretchFactor(0, 70)
         work_splitter.setStretchFactor(1, 30)
 
-        # Vertical chart proportions: 48% 15m, 38% 3m, 14% RSI
+        # Vertical chart proportions: 48% 15m, 52% 3m
         self.chart_splitter.setStretchFactor(0, 48)
-        self.chart_splitter.setStretchFactor(1, 38)
-        self.chart_splitter.setStretchFactor(2, 14)
+        self.chart_splitter.setStretchFactor(1, 52)
 
         main_layout.addWidget(work_splitter)
-
-    def _create_plot_widget(self, title: str) -> pg.PlotWidget:
-        """Create a styled PyQtGraph PlotWidget matching TradingView Dark aesthetics."""
-        plot = pg.PlotWidget()
-        plot.setBackground("#1E222D")
-        plot.setTitle(
-            f"<span style='color: #D1D4DC; font-weight: 600; font-size: 11px; font-family: -apple-system, sans-serif;'>"
-            f"{title}</span>"
-        )
-        plot.getViewBox().setBorder(pg.mkPen(color="#2A2E39", width=1))
-
-        # Hide top and right bounding box axes
-        plot.showAxis("top", False)
-        plot.showAxis("right", False)
-
-        # Style left and bottom axes
-        axis_pen = pg.mkPen(color="#2A2E39", width=1)
-        text_pen = pg.mkPen(color="#787B86")
-        font = QFont("SF Mono", 9)
-
-        b_axis = plot.getAxis("bottom")
-        b_axis.setPen(axis_pen)
-        b_axis.setTextPen(text_pen)
-        b_axis.setStyle(tickFont=font)
-        b_axis.enableAutoSIPrefix(False)
-
-        l_axis = plot.getAxis("left")
-        l_axis.setPen(axis_pen)
-        l_axis.setTextPen(text_pen)
-        l_axis.setStyle(tickFont=font)
-        l_axis.enableAutoSIPrefix(False)
-
-        # Faint dashed grid lines (#2A2E39)
-        plot.showGrid(x=True, y=True, alpha=0.30)
-
-        # Minimal dark legend
-        legend = plot.addLegend(offset=(12, 10), labelTextColor="#94A3B8")
-        legend.setBrush(pg.mkBrush(30, 34, 45, 190))
-        legend.setPen(pg.mkPen("#2A2E39"))
-
-        return plot
 
     # =========================================================================
     # HEADER BAR & BRANDING
@@ -490,7 +441,7 @@ class DecodeXMainWindow(QMainWindow):
         # DecodeX Official Logo
         logo_path = str(PROJECT_ROOT / "assets" / "decodex_logo_full.png")
         if os.path.exists(logo_path):
-            logo_pix = QtGui.QPixmap(logo_path)
+            logo_pix = QPixmap(logo_path)
             if not logo_pix.isNull():
                 scaled_logo = logo_pix.scaledToHeight(36, Qt.TransformationMode.SmoothTransformation)
                 logo_lbl = QLabel()
@@ -541,6 +492,14 @@ class DecodeXMainWindow(QMainWindow):
 
         layout.addStretch()
 
+        # Macro Sentiment Pill
+        self.macro_header_badge = QLabel("🌐 Macro: Neutral (+0.00)")
+        self.macro_header_badge.setStyleSheet(
+            "background-color: rgba(42, 46, 57, 0.6); border: 1px solid #363A45; color: #CBD5E1; "
+            "border-radius: 12px; padding: 4px 10px; font-weight: 700; font-size: 11px;"
+        )
+        layout.addWidget(self.macro_header_badge)
+
         # Connection Status Badge
         self.conn_badge = QLabel("🟢 Connected (Mode 3 FULL_SNAP Active | Tokens: 23)")
         self.conn_badge.setObjectName("status_badge")
@@ -559,16 +518,36 @@ class DecodeXMainWindow(QMainWindow):
         layout.addLayout(brand_box)
 
     # =========================================================================
-    # RIGHT TELEMETRY PANEL (DEPTH + CONFLUENCE + OPTIONS CHAIN)
+    # RIGHT TABBED PANEL (EXECUTION + LIVE NEWS + RISK CONTROLS)
     # =========================================================================
 
-    def _build_telemetry_panel(self) -> QWidget:
+    def _build_right_tabs_panel(self) -> QWidget:
+        """Create tabbed right-side panel with Execution, Live News, and Risk Controls."""
+        self.tabs = QTabWidget()
+        self.tab_widget = self.tabs
+
+        # Tab 1: Execution Telemetry (Confluence + Depth + Options Grid)
+        self.tabs.addTab(self._build_execution_tab(), "🎯 Execution")
+
+        # Tab 2: Live Market News & Macro Confluence
+        self.tabs.addTab(self._build_news_tab(), "📰 Market News")
+
+        # Tab 3: Risk Management & Quant Governance
+        self.tabs.addTab(self._build_risk_tab(), "🛡️ Risk & Controls")
+
+        return self.tabs
+
+    # -------------------------------------------------------------------------
+    # TAB 1: EXECUTION TELEMETRY
+    # -------------------------------------------------------------------------
+
+    def _build_execution_tab(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(4, 6, 4, 6)
         layout.setSpacing(8)
 
-        # 1. MTF 6-Factor Confluence Card
+        # 1. 6-Factor MTF Confluence Card
         layout.addWidget(self._build_confluence_card())
 
         # 2. Level 2 Market Depth & Imbalance Card
@@ -693,6 +672,231 @@ class DecodeXMainWindow(QMainWindow):
 
         return card
 
+    # -------------------------------------------------------------------------
+    # TAB 2: LIVE MARKET NEWS & MACRO CONFLUENCE
+    # -------------------------------------------------------------------------
+
+    def _build_news_tab(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 6, 4, 6)
+        layout.setSpacing(8)
+
+        # 1. Macro Impact Synthesis Card
+        macro_card = QFrame()
+        macro_card.setObjectName("highlight_card")
+        m_layout = QVBoxLayout(macro_card)
+        m_layout.setContentsMargins(10, 8, 10, 8)
+        m_layout.setSpacing(6)
+
+        h_box = QHBoxLayout()
+        m_title = QLabel("🌐 Global Macro & Sentiment Confluence")
+        m_title.setStyleSheet("font-weight: 700; color: #60A5FA; font-size: 12px;")
+        self.news_bias_badge = QLabel("BIAS: BULLISH (+0.42)")
+        self.news_bias_badge.setStyleSheet(
+            "background: #00C853; color: white; font-weight: 800; font-size: 11px; padding: 3px 8px; border-radius: 10px;"
+        )
+        h_box.addWidget(m_title)
+        h_box.addStretch()
+        h_box.addWidget(self.news_bias_badge)
+        m_layout.addLayout(h_box)
+
+        self.macro_breakdown_lbl = QLabel("Global Macro: +0.35 | Domestic Sentiment: +0.50")
+        self.macro_breakdown_lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 500;")
+        m_layout.addWidget(self.macro_breakdown_lbl)
+
+        # Global Macro Tickers Grid (USD/INR, Brent Crude, US 10Y, GIFT NIFTY)
+        self.macro_tickers_lbl = QLabel(
+            "USD/INR: ₹84.38 (–0.12%) | Brent: $74.20 (+0.45%) | US 10Y: 4.42% (–0.03%)"
+        )
+        self.macro_tickers_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-size: 11px; color: #E2E8F0; font-weight: 600;')
+        m_layout.addWidget(self.macro_tickers_lbl)
+
+        self.catalysts_lbl = QLabel("Key Catalysts: FPI Inflows, Rate Pause, Strong Bank Earnings")
+        self.catalysts_lbl.setStyleSheet("font-size: 11px; color: #38BDF8; font-weight: 600;")
+        m_layout.addWidget(self.catalysts_lbl)
+
+        layout.addWidget(macro_card)
+
+        # 2. Scrollable Live Financial News Feed
+        feed_card = QFrame()
+        feed_card.setObjectName("card")
+        f_layout = QVBoxLayout(feed_card)
+        f_layout.setContentsMargins(10, 8, 10, 8)
+        f_layout.setSpacing(6)
+
+        feed_header = QHBoxLayout()
+        feed_title = QLabel("📰 Live Indian Financial News Stream")
+        feed_title.setStyleSheet("font-weight: 700; color: #F8FAFC; font-size: 12px;")
+        feed_badge = QLabel("🟢 FreeNewsAPI.io / RSS")
+        feed_badge.setStyleSheet("font-size: 10px; color: #00E676; font-weight: 600;")
+        feed_header.addWidget(feed_title)
+        feed_header.addStretch()
+        feed_header.addWidget(feed_badge)
+        f_layout.addLayout(feed_header)
+
+        self.news_browser = QTextBrowser()
+        self.news_browser.setOpenExternalLinks(True)
+        self.news_browser.setStyleSheet(
+            "background-color: #181B24; border: 1px solid #2A2E39; border-radius: 6px; "
+            "color: #D1D4DC; font-size: 12px; padding: 6px;"
+        )
+        self._populate_default_news_view()
+        f_layout.addWidget(self.news_browser)
+
+        layout.addWidget(feed_card)
+        return panel
+
+    def _populate_default_news_view(self) -> None:
+        """Render initial formatted HTML news headlines."""
+        html = """
+        <div style="font-family: -apple-system, sans-serif; line-height: 1.5;">
+            <div style="background: #1E222D; border: 1px solid #2A2E39; border-radius: 6px; padding: 8px; margin-bottom: 8px;">
+                <span style="background: rgba(8, 153, 129, 0.2); color: #089981; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">🟢 BULLISH</span>
+                <span style="color: #787B86; font-size: 10px; margin-left: 6px;">Moneycontrol • Today</span>
+                <div style="color: #F8FAFC; font-weight: 600; font-size: 12px; margin-top: 4px;">
+                    Nifty breaches fresh resistance as institutional buying accelerates across banking and tech heavyweights.
+                </div>
+            </div>
+            <div style="background: #1E222D; border: 1px solid #2A2E39; border-radius: 6px; padding: 8px; margin-bottom: 8px;">
+                <span style="background: rgba(8, 153, 129, 0.2); color: #089981; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">🟢 BULLISH</span>
+                <span style="color: #787B86; font-size: 10px; margin-left: 6px;">Economic Times • Today</span>
+                <div style="color: #F8FAFC; font-weight: 600; font-size: 12px; margin-top: 4px;">
+                    Crude prices cool toward $74/bbl easing domestic inflation worries; FPI flows turn net positive in cash market.
+                </div>
+            </div>
+            <div style="background: #1E222D; border: 1px solid #2A2E39; border-radius: 6px; padding: 8px;">
+                <span style="background: rgba(120, 123, 134, 0.2); color: #94A3B8; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">⚪ NEUTRAL</span>
+                <span style="color: #787B86; font-size: 10px; margin-left: 6px;">LiveMint • Today</span>
+                <div style="color: #F8FAFC; font-weight: 600; font-size: 12px; margin-top: 4px;">
+                    RBI commentary highlights robust GDP growth trajectory while monitoring global central bank rate cues.
+                </div>
+            </div>
+        </div>
+        """
+        self.news_browser.setHtml(html)
+
+    # -------------------------------------------------------------------------
+    # TAB 3: RISK MANAGEMENT & QUANT GOVERNANCE
+    # -------------------------------------------------------------------------
+
+    def _build_risk_tab(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 6, 4, 6)
+        layout.setSpacing(8)
+
+        # 1. Position Sizing & Capital Allocation Card
+        sizing_card = QFrame()
+        sizing_card.setObjectName("card")
+        s_layout = QVBoxLayout(sizing_card)
+        s_layout.setContentsMargins(12, 10, 12, 10)
+        s_layout.setSpacing(8)
+
+        s_title = QLabel("📐 Dynamic Position & Risk Sizing")
+        s_title.setStyleSheet("font-weight: 700; color: #F8FAFC; font-size: 12px;")
+        s_layout.addWidget(s_title)
+
+        # Portfolio Capital
+        cap_box = QHBoxLayout()
+        cap_box.addWidget(QLabel("Account Equity (INR):"))
+        self.equity_spin = QSpinBox()
+        self.equity_spin.setRange(10_000, 10_000_000)
+        self.equity_spin.setSingleStep(50_000)
+        self.equity_spin.setValue(int(self.account_equity))
+        self.equity_spin.valueChanged.connect(self._on_risk_params_changed)
+        cap_box.addWidget(self.equity_spin)
+        s_layout.addLayout(cap_box)
+
+        # Risk per Trade Slider
+        risk_box = QVBoxLayout()
+        self.risk_pct_lbl = QLabel(f"Risk per Trade: {self.risk_pct:.2f}% (Max Risk: ₹{self.account_equity * self.risk_pct / 100:,.0f})")
+        self.risk_pct_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #D1D4DC;")
+        self.risk_slider = QSlider(Qt.Orientation.Horizontal)
+        self.risk_slider.setRange(25, 300)  # 0.25% to 3.00%
+        self.risk_slider.setValue(int(self.risk_pct * 100))
+        self.risk_slider.valueChanged.connect(self._on_risk_params_changed)
+        risk_box.addWidget(self.risk_pct_lbl)
+        risk_box.addWidget(self.risk_slider)
+        s_layout.addLayout(risk_box)
+
+        # ATR Stop Multiplier Slider
+        atr_box = QVBoxLayout()
+        self.atr_mult_lbl = QLabel(f"ATR Stop Multiplier: {self.atr_mult:.2f}x")
+        self.atr_mult_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #D1D4DC;")
+        self.atr_slider = QSlider(Qt.Orientation.Horizontal)
+        self.atr_slider.setRange(10, 30)  # 1.0x to 3.0x
+        self.atr_slider.setValue(int(self.atr_mult * 10))
+        self.atr_slider.valueChanged.connect(self._on_risk_params_changed)
+        atr_box.addWidget(self.atr_mult_lbl)
+        atr_box.addWidget(self.atr_slider)
+        s_layout.addLayout(atr_box)
+
+        # Dynamic Sizing Metrics Grid
+        grid_metrics = QGridLayout()
+        grid_metrics.addWidget(QLabel("Recommended Sizing:"), 0, 0)
+        self.recommended_size_lbl = QLabel("65 Qty (1 Lot)")
+        self.recommended_size_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 700; color: #00E5FF;')
+        grid_metrics.addWidget(self.recommended_size_lbl, 0, 1)
+
+        grid_metrics.addWidget(QLabel("Small-Account Guardrail:"), 1, 0)
+        self.guardrail_lbl = QLabel("✅ SAFE (Within Risk Limit)")
+        self.guardrail_lbl.setStyleSheet("font-weight: 700; color: #089981;")
+        grid_metrics.addWidget(self.guardrail_lbl, 1, 1)
+
+        s_layout.addLayout(grid_metrics)
+
+        # Risk Allocation Progress Bar
+        self.risk_pbar = QProgressBar()
+        self.risk_pbar.setValue(int(self.risk_pct / 3.0 * 100))
+        s_layout.addWidget(self.risk_pbar)
+
+        layout.addWidget(sizing_card)
+
+        # 2. Capital Protection & 3-Stage Breakeven Lock Card
+        prot_card = QFrame()
+        prot_card.setObjectName("highlight_card")
+        p_layout = QVBoxLayout(prot_card)
+        p_layout.setContentsMargins(12, 10, 12, 10)
+        p_layout.setSpacing(8)
+
+        p_title = QLabel("🛡️ Profit-Locking & Runner Trail")
+        p_title.setStyleSheet("font-weight: 700; color: #F8FAFC; font-size: 12px;")
+        p_layout.addWidget(p_title)
+
+        self.stage_lbl = QLabel("Stage 0: Initial Risk (1.5x Structural ATR Stop)")
+        self.stage_lbl.setStyleSheet(
+            "background: rgba(41, 98, 255, 0.15); border: 1px solid #2962FF; color: #00E5FF; "
+            "padding: 6px; border-radius: 4px; font-weight: 700; font-size: 11px;"
+        )
+        p_layout.addWidget(self.stage_lbl)
+
+        # Safety & Strategy Toggles
+        self.chk_hard_sl = QCheckBox("🛡️ Hard Capital Stop Loss Guardrail")
+        self.chk_hard_sl.setChecked(True)
+        p_layout.addWidget(self.chk_hard_sl)
+
+        self.chk_class_b = QCheckBox("🧪 Show Experimental (Class B) Models")
+        self.chk_class_b.setChecked(True)
+        p_layout.addWidget(self.chk_class_b)
+
+        self.chk_chime = QCheckBox("🔊 Play Sound Chime on Signal Change")
+        self.chk_chime.setChecked(True)
+        self.chk_chime.stateChanged.connect(lambda s: setattr(self, "enable_sound_chime", s == 2))
+        p_layout.addWidget(self.chk_chime)
+
+        test_chime_btn = QPushButton("🔔 Test Signal Chime")
+        test_chime_btn.setStyleSheet(
+            "background: #2A2E39; border: 1px solid #363A45; border-radius: 4px; padding: 4px; color: #F8FAFC; font-weight: 600;"
+        )
+        test_chime_btn.clicked.connect(self._play_chime)
+        p_layout.addWidget(test_chime_btn)
+
+        layout.addWidget(prot_card)
+        layout.addStretch()
+
+        return panel
+
     # =========================================================================
     # QT SIGNALS & REAL-TIME EVENT HANDLERS
     # =========================================================================
@@ -703,6 +907,7 @@ class DecodeXMainWindow(QMainWindow):
         self.worker.l2_depth_signal.connect(self.on_l2_depth_received)
         self.worker.mtf_signal.connect(self.on_mtf_updated)
         self.worker.options_chain_signal.connect(self.on_options_chain_updated)
+        self.worker.news_sentiment_signal.connect(self.on_news_received)
         self.worker.connection_status_signal.connect(self.on_connection_status)
 
     @pyqtSlot(dict)
@@ -711,13 +916,23 @@ class DecodeXMainWindow(QMainWindow):
         self.spot_price = tick["ltp"]
         self.spot_price_lbl.setText(f"₹{self.spot_price:,.2f}")
 
+        # Bridge live tick candle update to TradingView charts via runJavaScript
+        b15 = tick.get("bar_15m")
+        if b15:
+            js_15 = f"if (window.updateLiveBar) window.updateLiveBar({json.dumps(b15)}, {self.last_vwap}, {self.last_st});"
+            self.chart_15m_view.page().runJavaScript(js_15)
+
+        b3 = tick.get("bar_3m")
+        if b3:
+            js_3 = f"if (window.updateLiveBar) window.updateLiveBar({json.dumps(b3)}, {self.last_ema9}, {self.last_ema21}, {self.last_ema50}, {self.last_rsi});"
+            self.chart_3m_view.page().runJavaScript(js_3)
+
     @pyqtSlot(dict)
     def on_l2_depth_received(self, depth: Dict[str, Any]) -> None:
         """Render 5-level market depth matrix and Order Book Imbalance (OBI)."""
         obi = depth.get("order_book_imbalance", 0.0)
         self.current_obi = obi
 
-        # Update OBI label styling
         if obi > 0.15:
             self.obi_lbl.setText(f"OBI: {obi:+.2f} (Heavy Buying)")
             self.obi_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 800; color: #089981; font-size: 12px;')
@@ -732,7 +947,6 @@ class DecodeXMainWindow(QMainWindow):
             f"Top Spread: {depth.get('spread', 0):.2f} pts | Micro-Price: ₹{depth.get('micro_price', 0):,.2f}"
         )
 
-        # Populate Depth Table
         bids = depth.get("bids", [])
         asks = depth.get("asks", [])
         for i in range(5):
@@ -747,102 +961,76 @@ class DecodeXMainWindow(QMainWindow):
             self._set_table_item(self.depth_table, i, 4, format_qty(a.get('quantity', 0)), color="#F23645")
             self._set_table_item(self.depth_table, i, 5, str(a.get("orders", "—")), color="#787B86", align=Qt.AlignmentFlag.AlignCenter)
 
+    def _on_15m_chart_loaded(self, ok: bool) -> None:
+        """Handle 15m QWebEngineView loadFinished signal."""
+        self._chart_15m_ready = ok
+        if ok and self._last_p15:
+            js_cmd_15 = f"if (window.setChartData) window.setChartData({json.dumps(self._last_p15)});"
+            self.chart_15m_view.page().runJavaScript(js_cmd_15)
+
+    def _on_3m_chart_loaded(self, ok: bool) -> None:
+        """Handle 3m QWebEngineView loadFinished signal."""
+        self._chart_3m_ready = ok
+        if ok and self._last_p3:
+            js_cmd_3 = f"if (window.setChartData) window.setChartData({json.dumps(self._last_p3)});"
+            self.chart_3m_view.page().runJavaScript(js_cmd_3)
+
     @pyqtSlot(dict)
     def on_mtf_updated(self, mtf_data: Dict[str, Any]) -> None:
-        """Update 15m structural and 3m execution plots with indicators and confluence."""
-        # 1. Update 15m Structural Frame Plot
-        bars_15m = mtf_data.get("15m", {}).get("bars", [])
-        if bars_15m:
-            candle_data_15m = [
-                (i, b["open"], b["close"], b["low"], b["high"]) for i, b in enumerate(bars_15m)
-            ]
-            self.candle_item_15m.set_data(candle_data_15m)
+        """Update TradingView Lightweight Charts, Confluence Gate, and Risk telemetry."""
+        # 1. Update 15m Structural Frame TradingView Chart via JS Bridge
+        d15 = mtf_data.get("15m", {})
+        candles_15m = d15.get("candles", [])
+        vwap_data = d15.get("vwap_data", [])
+        st_data = d15.get("supertrend_data", [])
 
-            n15 = len(bars_15m)
-            x15_arr = np.arange(n15)
+        self.last_vwap = d15.get("anchored_vwap", self.spot_price)
+        self.last_st = d15.get("supertrend", self.spot_price)
 
-            vwap_series = mtf_data["15m"].get("vwap_series")
-            if vwap_series and len(vwap_series) == n15:
-                self.vwap_curve_15m.setData(x15_arr, vwap_series)
-            else:
-                vwap_val = mtf_data["15m"].get("anchored_vwap", self.spot_price)
-                self.vwap_curve_15m.setData(x15_arr, [vwap_val] * n15)
+        if candles_15m:
+            p15 = {"candles": candles_15m, "vwap": vwap_data, "supertrend": st_data}
+            self._last_p15 = p15
+            if self._chart_15m_ready:
+                js_cmd_15 = f"if (window.setChartData) window.setChartData({json.dumps(p15)});"
+                self.chart_15m_view.page().runJavaScript(js_cmd_15)
 
-            st_series = mtf_data["15m"].get("supertrend_series")
-            if st_series and len(st_series) == n15:
-                self.supertrend_curve_15m.setData(x15_arr, st_series)
-            else:
-                st_val = mtf_data["15m"].get("supertrend", self.spot_price)
-                self.supertrend_curve_15m.setData(x15_arr, [st_val] * n15)
+        # 2. Update 3m Execution Frame TradingView Chart via JS Bridge
+        d3 = mtf_data.get("3m", {})
+        candles_3m = d3.get("candles", [])
+        e9_data = d3.get("ema9_data", [])
+        e21_data = d3.get("ema21_data", [])
+        e50_data = d3.get("ema50_data", [])
+        rsi_data = d3.get("rsi_data", [])
 
-            # Auto-frame 15m ViewBox
-            vis_15 = bars_15m[-min(45, n15):]
-            lows_15 = [b["low"] for b in vis_15]
-            highs_15 = [b["high"] for b in vis_15]
-            if lows_15 and highs_15:
-                y_min_15 = min(lows_15)
-                y_max_15 = max(highs_15)
-                pad_15 = max((y_max_15 - y_min_15) * 0.14, 12.0)
-                self.plot_15m.setYRange(y_min_15 - pad_15, y_max_15 + pad_15, padding=0)
-                self.plot_15m.setXRange(max(0, n15 - 50), n15 + 4, padding=0)
+        self.last_ema9 = d3.get("ema_9", self.spot_price)
+        self.last_ema21 = d3.get("ema_21", self.spot_price)
+        self.last_ema50 = d3.get("ema_50", self.spot_price)
+        self.last_rsi = d3.get("rsi_14", 50.0)
 
-        # 2. Update 3m Execution Frame Plot
-        bars_3m = mtf_data.get("3m", {}).get("bars", [])
-        if bars_3m:
-            candle_data_3m = [
-                (i, b["open"], b["close"], b["low"], b["high"]) for i, b in enumerate(bars_3m)
-            ]
-            self.candle_item_3m.set_data(candle_data_3m)
+        if candles_3m:
+            p3 = {
+                "candles": candles_3m,
+                "ema9": e9_data,
+                "ema21": e21_data,
+                "ema50": e50_data,
+                "rsi": rsi_data,
+            }
+            self._last_p3 = p3
+            if self._chart_3m_ready:
+                js_cmd_3 = f"if (window.setChartData) window.setChartData({json.dumps(p3)});"
+                self.chart_3m_view.page().runJavaScript(js_cmd_3)
 
-            n3 = len(bars_3m)
-            x3_arr = np.arange(n3)
-
-            ema9_s = mtf_data["3m"].get("ema_9_series")
-            if ema9_s and len(ema9_s) == n3:
-                self.ema9_curve_3m.setData(x3_arr, ema9_s)
-            else:
-                ema9 = mtf_data["3m"].get("ema_9", self.spot_price)
-                self.ema9_curve_3m.setData(x3_arr, [ema9] * n3)
-
-            ema21_s = mtf_data["3m"].get("ema_21_series")
-            if ema21_s and len(ema21_s) == n3:
-                self.ema21_curve_3m.setData(x3_arr, ema21_s)
-            else:
-                ema21 = mtf_data["3m"].get("ema_21", self.spot_price)
-                self.ema21_curve_3m.setData(x3_arr, [ema21] * n3)
-
-            ema50_s = mtf_data["3m"].get("ema_50_series")
-            if ema50_s and len(ema50_s) == n3:
-                self.ema50_curve_3m.setData(x3_arr, ema50_s)
-            else:
-                ema50 = mtf_data["3m"].get("ema_50", self.spot_price)
-                self.ema50_curve_3m.setData(x3_arr, [ema50] * n3)
-
-            # Auto-frame 3m ViewBox
-            vis_3 = bars_3m[-min(55, n3):]
-            lows_3 = [b["low"] for b in vis_3]
-            highs_3 = [b["high"] for b in vis_3]
-            if lows_3 and highs_3:
-                y_min_3 = min(lows_3)
-                y_max_3 = max(highs_3)
-                pad_3 = max((y_max_3 - y_min_3) * 0.14, 12.0)
-                self.plot_3m.setYRange(y_min_3 - pad_3, y_max_3 + pad_3, padding=0)
-                self.plot_3m.setXRange(max(0, n3 - 60), n3 + 5, padding=0)
-
-            # 3. Update RSI Momentum Oscillator
-            rsi_s = mtf_data["3m"].get("rsi_series")
-            if rsi_s and len(rsi_s) == n3:
-                self.rsi_curve.setData(x3_arr, rsi_s)
-            else:
-                rsi_val = mtf_data["3m"].get("rsi_14", 50.0)
-                self.rsi_curve.setData(x3_arr, [rsi_val] * n3)
-            self.plot_rsi.setYRange(10, 90, padding=0)
-
-        # 4. Update Confluence Banner & Badges
+        # 3. Update Confluence Banner & Badges
         confl = mtf_data.get("confluence", {})
         sig = confl.get("signal", "CONFLUENCE WAIT")
         score = confl.get("score", 0.0)
         self.score_badge.setText(f"Score: {score:+.2f}")
+
+        # Check for signal change chime
+        if sig != self.last_signal:
+            if "ENTRY" in sig and self.enable_sound_chime:
+                self._play_chime()
+            self.last_signal = sig
 
         if "BULLISH" in sig:
             self.confluence_banner.setText("🟢 BULLISH ENTRY (15m + 3m Converged)")
@@ -864,18 +1052,33 @@ class DecodeXMainWindow(QMainWindow):
             )
 
         # Update Timeframe Badges
-        bias_15 = mtf_data.get("15m", {}).get("bias", "NEUTRAL")
-        trig_3 = mtf_data.get("3m", {}).get("trigger", "WAIT")
+        bias_15 = d15.get("bias", "NEUTRAL")
+        trig_3 = d3.get("trigger", "WAIT")
         self.badge_15m.setText(f"15m Bias: {bias_15}")
         self.badge_3m.setText(f"3m Trigger: {trig_3}")
 
-        # Update Trade Plan
+        # Update Trade Plan & Position Sizing
         entry = confl.get("entry_price", self.spot_price)
         sl = confl.get("stop_loss", self.spot_price - 50)
         t1 = confl.get("target_1", self.spot_price + 80)
         self.trade_plan_lbl.setText(
             f"Plan: Entry: ₹{entry:,.1f} | SL: ₹{sl:,.1f} | Target: ₹{t1:,.1f} | R:R: {confl.get('risk_reward', '1:2.3')}"
         )
+
+        # Dynamic Position Sizing Calculation
+        sl_dist = abs(entry - sl)
+        lot_size = 25 if self.current_instrument == "NIFTY" else 15
+        max_risk_inr = self.account_equity * (self.risk_pct / 100.0)
+        risk_per_lot = sl_dist * lot_size
+        rec_lots = max(1, int(max_risk_inr / max(risk_per_lot, 1.0)))
+
+        self.recommended_size_lbl.setText(f"{rec_lots * lot_size} Qty ({rec_lots} Lots)")
+        if risk_per_lot > max_risk_inr * 1.2:
+            self.guardrail_lbl.setText("⚠️ RISK OVERHANG (Reduce Lots)")
+            self.guardrail_lbl.setStyleSheet("font-weight: 700; color: #F59E0B;")
+        else:
+            self.guardrail_lbl.setText("✅ SAFE (Within Risk Limit)")
+            self.guardrail_lbl.setStyleSheet("font-weight: 700; color: #089981;")
 
     @pyqtSlot(dict)
     def on_options_chain_updated(self, opt_data: Dict[str, Any]) -> None:
@@ -891,7 +1094,6 @@ class DecodeXMainWindow(QMainWindow):
             self.coi_delta_lbl.setStyleSheet('font-family: "SF Mono", monospace; font-weight: 700; color: #F23645; font-size: 11px;')
 
         for i, s in enumerate(strikes[:5]):
-            # CE Side
             self._set_table_item(self.options_table, i, 0, f"{s['ce_iv']:.1f}%", color="#94A3B8", align=Qt.AlignmentFlag.AlignCenter)
             self._set_table_item(self.options_table, i, 1, f"{s['ce_delta']:+.2f}", color="#089981" if s["ce_delta"] >= 0 else "#F23645", align=Qt.AlignmentFlag.AlignCenter)
             self._set_table_item(
@@ -907,7 +1109,6 @@ class DecodeXMainWindow(QMainWindow):
                 align=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             )
 
-            # Strike Center
             is_atm = s.get("is_atm", False)
             self._set_table_item(
                 self.options_table, i, 4, f"{s['strike']:,.0f}",
@@ -917,7 +1118,6 @@ class DecodeXMainWindow(QMainWindow):
                 align=Qt.AlignmentFlag.AlignCenter,
             )
 
-            # PE Side
             self._set_table_item(
                 self.options_table, i, 5, format_qty(s["pe_oi"]),
                 color="#D1D4DC",
@@ -932,6 +1132,76 @@ class DecodeXMainWindow(QMainWindow):
             )
             self._set_table_item(self.options_table, i, 7, f"{s['pe_delta']:+.2f}", color="#089981" if s["pe_delta"] >= 0 else "#F23645", align=Qt.AlignmentFlag.AlignCenter)
             self._set_table_item(self.options_table, i, 8, f"{s['pe_iv']:.1f}%", color="#94A3B8", align=Qt.AlignmentFlag.AlignCenter)
+
+    @pyqtSlot(dict)
+    def on_news_received(self, news_data: Dict[str, Any]) -> None:
+        """Render live Indian financial news headlines and global macro quotes."""
+        score = news_data.get("combined_score", 0.0)
+        bias = news_data.get("confluence_bias", "NEUTRAL")
+        g_score = news_data.get("global_macro_score", 0.0)
+        d_score = news_data.get("news_sentiment_score", 0.0)
+
+        # Update Header Sentiment Badge
+        badge_col = "#089981" if score >= 0.15 else ("#F23645" if score <= -0.15 else "#787B86")
+        self.macro_header_badge.setText(f"🌐 Macro: {bias} ({score:+.2f})")
+        self.macro_header_badge.setStyleSheet(
+            f"background-color: rgba(42, 46, 57, 0.7); border: 1px solid {badge_col}; color: {badge_col}; "
+            "border-radius: 12px; padding: 4px 10px; font-weight: 700; font-size: 11px;"
+        )
+
+        # Update News Tab Badges & Metrics
+        self.news_bias_badge.setText(f"BIAS: {bias} ({score:+.2f})")
+        self.news_bias_badge.setStyleSheet(
+            f"background: {badge_col}; color: white; font-weight: 800; font-size: 11px; padding: 3px 8px; border-radius: 10px;"
+        )
+        self.macro_breakdown_lbl.setText(f"Global Macro: {g_score:+.2f} | Domestic Sentiment: {d_score:+.2f}")
+
+        # Format Macro Tickers
+        quotes = news_data.get("macro_quotes", [])
+        if quotes:
+            q_strs = []
+            for q in quotes[:4]:
+                color = "green" if q.get("change_pct", 0) >= 0 else "red"
+                q_strs.append(f"{q.get('name', q.get('symbol'))}: {q.get('price', 0):,.2f} ({q.get('change_pct', 0):+.2f}%)")
+            self.macro_tickers_lbl.setText(" | ".join(q_strs))
+
+        # Format Catalysts
+        drivers = news_data.get("key_drivers", [])
+        if drivers:
+            self.catalysts_lbl.setText(f"Key Catalysts: {', '.join(drivers[:5])}")
+
+        # Format News Articles HTML
+        headlines = news_data.get("headlines", [])
+        if headlines:
+            cards_html = ['<div style="font-family: -apple-system, sans-serif; line-height: 1.4;">']
+            for h in headlines[:20]:
+                sentiment = h.get("sentiment", "NEUTRAL")
+                if sentiment == "BULLISH":
+                    sent_pill = '<span style="background: rgba(8, 153, 129, 0.2); color: #089981; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">🟢 BULLISH</span>'
+                elif sentiment == "BEARISH":
+                    sent_pill = '<span style="background: rgba(242, 54, 69, 0.2); color: #F23645; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">🔴 BEARISH</span>'
+                else:
+                    sent_pill = '<span style="background: rgba(120, 123, 134, 0.2); color: #94A3B8; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">⚪ NEUTRAL</span>'
+
+                source_time = f"<span style='color: #787B86; font-size: 10px; margin-left: 6px;'>{h.get('source', 'News')} • {h.get('published', '')}</span>"
+                title_html = f"<div style='color: #F8FAFC; font-weight: 600; font-size: 12px; margin-top: 4px;'>{h.get('title', '')}</div>"
+
+                kw = h.get("keywords", [])
+                kw_html = ""
+                if kw:
+                    kw_tags = [f"<span style='background: #2A2E39; color: #38BDF8; font-size: 9px; padding: 1px 5px; border-radius: 3px;'>{k}</span>" for k in kw[:3]]
+                    kw_html = f"<div style='margin-top: 4px; display: flex; gap: 4px;'>{' '.join(kw_tags)}</div>"
+
+                card = f"""
+                <div style="background: #1E222D; border: 1px solid #2A2E39; border-radius: 6px; padding: 8px; margin-bottom: 8px;">
+                    <div>{sent_pill}{source_time}</div>
+                    {title_html}
+                    {kw_html}
+                </div>
+                """
+                cards_html.append(card)
+            cards_html.append("</div>")
+            self.news_browser.setHtml("\n".join(cards_html))
 
     @pyqtSlot(str, str)
     def on_connection_status(self, status: str, message: str) -> None:
@@ -995,6 +1265,27 @@ class DecodeXMainWindow(QMainWindow):
         self.worker._warmup_historical_bars()
         logger.info("Switched active instrument to %s.", inst)
 
+    def _on_risk_params_changed(self) -> None:
+        """Handle changes to risk controls."""
+        self.account_equity = float(self.equity_spin.value())
+        self.risk_pct = self.risk_slider.value() / 100.0
+        self.atr_mult = self.atr_slider.value() / 10.0
+
+        max_risk = self.account_equity * (self.risk_pct / 100.0)
+        self.risk_pct_lbl.setText(f"Risk per Trade: {self.risk_pct:.2f}% (Max Risk: ₹{max_risk:,.0f})")
+        self.atr_mult_lbl.setText(f"ATR Stop Multiplier: {self.atr_mult:.2f}x")
+        self.risk_pbar.setValue(int(self.risk_pct / 3.0 * 100))
+
+    def _play_chime(self) -> None:
+        """Play terminal audio chime on signal transition or button press."""
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["afplay", "/System/Library/Sounds/Ping.aiff"], stderr=subprocess.DEVNULL)
+            else:
+                print("\a")
+        except Exception:
+            pass
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         """Clean shutdown of background QThread worker upon window close."""
         logger.info("Shutting down DecodeX Trading Terminal...")
@@ -1008,7 +1299,6 @@ class DecodeXMainWindow(QMainWindow):
 
 def main() -> None:
     """Launch native DecodeX Trading application."""
-    # Enable High-DPI Retina Display support
     if hasattr(QtCore.Qt.ApplicationAttribute, "AA_EnableHighDpiScaling"):
         QApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
     if hasattr(QtCore.Qt.ApplicationAttribute, "AA_UseHighDpiPixmaps"):
@@ -1024,7 +1314,7 @@ def main() -> None:
 
     icon_path = str(PROJECT_ROOT / "assets" / "decodex_icon.png")
     if os.path.exists(icon_path):
-        app.setWindowIcon(QtGui.QIcon(icon_path))
+        app.setWindowIcon(QIcon(icon_path))
 
     window = DecodeXMainWindow()
     window.show()

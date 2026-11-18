@@ -24,6 +24,8 @@ data/cache/groww_*
 data/*.duckdb*
 data/*.db
 data/cache/
+data/decodex_state.json*
+data/decodex_controls.json*
 
 # Logs & temp files
 logs/

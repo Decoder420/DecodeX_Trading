@@ -732,28 +732,47 @@ class DecodeXEngine:
             try:
                 report = await asyncio.to_thread(self.macro_engine.get_confluence_report)
                 if report:
-                    bias = report.get("bias", "NEUTRAL").upper()
-                    self.news_payload["bias"] = bias
-                    self.news_payload["bias_score"] = float(report.get("macro_confluence_score", 0.0))
-                    self.news_payload["global_macro_score"] = float(report.get("global_macro_score", 0.0))
-                    self.news_payload["domestic_sentiment_score"] = float(report.get("domestic_news_score", 0.0))
+                    if isinstance(report, dict):
+                        bias = str(report.get("bias", report.get("confluence_bias", "NEUTRAL"))).upper()
+                        self.news_payload["bias"] = bias
+                        self.news_payload["bias_score"] = float(report.get("macro_confluence_score", report.get("combined_score", 0.0)))
+                        self.news_payload["global_macro_score"] = float(report.get("global_macro_score", 0.0))
+                        self.news_payload["domestic_sentiment_score"] = float(report.get("domestic_news_score", report.get("news_sentiment_score", 0.0)))
+                        if report.get("key_drivers") or report.get("key_catalysts"):
+                            self.news_payload["catalysts"] = (report.get("key_drivers") or report.get("key_catalysts"))[:4]
+                        raw_news = report.get("raw_news") or report.get("headlines", [])
+                    else:
+                        bias = str(getattr(report, "confluence_bias", "NEUTRAL")).upper()
+                        self.news_payload["bias"] = bias
+                        self.news_payload["bias_score"] = float(getattr(report, "combined_score", 0.0))
+                        self.news_payload["global_macro_score"] = float(getattr(report, "global_macro_score", 0.0))
+                        self.news_payload["domestic_sentiment_score"] = float(getattr(report, "news_sentiment_score", 0.0))
+                        if getattr(report, "key_drivers", None):
+                            self.news_payload["catalysts"] = getattr(report, "key_drivers")[:4]
+                        raw_news = getattr(report, "headlines", [])
 
-                    if report.get("key_catalysts"):
-                        self.news_payload["catalysts"] = report["key_catalysts"][:4]
-
-                    raw_news = report.get("raw_news", [])
                     if raw_news:
                         hdls = []
                         for n in raw_news[:15]:
-                            s_score = n.get("sentiment_score", 0.0)
-                            s_badge = "BULLISH" if s_score > 0.15 else ("BEARISH" if s_score < -0.15 else "NEUTRAL")
-                            hdls.append({
-                                "title": n.get("title", ""),
-                                "source": n.get("source", "Financial Feed"),
-                                "sentiment": s_badge,
-                                "time": n.get("time_ago", "Recent"),
-                                "url": n.get("url", "#"),
-                            })
+                            if hasattr(n, "title"):
+                                s_badge = getattr(n, "sentiment", "NEUTRAL").upper()
+                                hdls.append({
+                                    "title": getattr(n, "title", ""),
+                                    "source": getattr(n, "source", "Financial Feed"),
+                                    "sentiment": s_badge,
+                                    "time": getattr(n, "published", "Recent"),
+                                    "url": "#",
+                                })
+                            elif isinstance(n, dict):
+                                s_score = n.get("sentiment_score", n.get("score", 0.0))
+                                s_badge = n.get("sentiment", "BULLISH" if s_score > 0.15 else ("BEARISH" if s_score < -0.15 else "NEUTRAL"))
+                                hdls.append({
+                                    "title": n.get("title", ""),
+                                    "source": n.get("source", "Financial Feed"),
+                                    "sentiment": s_badge,
+                                    "time": n.get("published", n.get("time_ago", "Recent")),
+                                    "url": n.get("url", "#"),
+                                })
                         if hdls:
                             self.news_payload["headlines"] = hdls
                     logger.info("Updated live news & macro sentiment: %s (%+.2f)", bias, self.news_payload["bias_score"])
